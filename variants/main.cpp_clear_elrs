@@ -1,0 +1,149 @@
+#include "Arduino.h"
+#include "SPI.h"
+#include "SimpleFOC.h"
+#include "SimpleFOCDrivers.h"
+#include "encoders/as5048a/MagneticSensorAS5048A.h"
+#include <CrsfSerial.h>
+
+
+#define SPI_2_MISO  12
+#define SPI_2_MOSI  11
+#define SPI_2_SCK   10
+
+
+#define SENSOR1_CS  13 // some digital pin that you're using as the nCS pin
+
+MagneticSensorSPIConfig_s myAS5048_SPI = {
+  .spi_mode = SPI_MODE1,
+  .clock_speed = 10000000,
+  .bit_resolution = 11,   //Too high causes rumbling? Maybe 10 better
+  .angle_register = 0x3FFF,
+  .data_start_bit = 13,
+  .command_rw_bit = 14,
+  .command_parity_bit = 15
+};
+MagneticSensorSPI sensor1 = MagneticSensorSPI(myAS5048_SPI, SENSOR1_CS);
+
+// MagneticSensorAS5048A sensor1(SENSOR1_CS, true);
+
+MbedSPI spi2(SPI_2_MISO, SPI_2_MOSI, SPI_2_SCK);
+
+BLDCMotor motor = BLDCMotor(11);
+BLDCDriver3PWM driver = BLDCDriver3PWM(3, 2, 6, 7);
+CrsfSerial crsf(Serial1, 420000);
+
+static void checkVbatt(uint16_t bat)
+{
+    crsf_sensor_battery_t crsfbatt = { 0 };
+    uint16_t scaledVoltage = bat;
+    // Values are MSB first (BigEndian)
+    crsfbatt.voltage = htobe16(scaledVoltage);
+    crsf.queuePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_BATTERY_SENSOR, &crsfbatt, sizeof(crsfbatt));
+
+}
+
+void packetChannels()
+{
+  int target;
+  float setpoint;
+
+    // Serial.print("CH1=");
+    // Serial.println();
+    target = crsf.getChannel(2);  //#989 - 2011
+      setpoint = target*((0.5*3.1416)/1022);
+    // Serial.print("CH1=");
+    // Serial.println(target);
+    checkVbatt( sensor1.getAngle()*1000);
+    // checkVbatt(target);
+    motor.target = setpoint;
+// 
+}
+
+static volatile float max_left,max_right;
+
+void setup() {
+  float sens;
+
+  spi2.begin();
+  sensor1.init(&spi2);
+
+  crsf.begin();
+  crsf.onPacketChannels = &packetChannels;
+
+  motor.linkSensor(&sensor1);
+
+  driver.voltage_power_supply = 12;
+  driver.pwm_frequency = 24000;
+  driver.init();
+
+  motor.linkDriver(&driver);
+  motor.controller = MotionControlType::angle;
+  motor.PID_velocity.P = 0.3;
+  motor.PID_velocity.I =10;
+  motor.PID_velocity.D = 0.0;
+  motor.voltage_limit = 12;
+  motor.LPF_velocity.Tf = 0.01;
+
+  motor.sensor_offset = motor.shaft_angle;
+  motor.init();
+  motor.initFOC();
+
+  Serial.println("calibrate");
+  sens = sensor1.getAngle();
+  max_right = sens;
+  max_left = sens;
+
+  int now = millis();
+  while((millis()-now) < 2500) {
+    sensor1.update();
+    sens = sensor1.getAngle();
+    if(sens < max_right)
+      max_right = sens;
+    if(sens > max_left);
+      max_left = sens;
+  }
+  Serial.println("run");
+
+  Serial.print("max left : ");
+  Serial.println(max_left);
+  Serial.print("max right : ");
+  Serial.println(max_right);
+  Serial.println(max_left-max_right);
+   _delay(100);
+}
+
+void loop() {
+
+  // if ((millis() - timer) > 30 )
+  // {
+  //   timer = millis();
+ 
+  //   motor.target = motor.target + 0.03;
+  // }
+
+  // angle_target = sensor.getAngle();
+  // if(angle_target>3.1416/2)
+  //   angle_target = 0;
+  // else
+  //   angle_target = 3.1416/2 + 0.1;
+  // motor.target = angle_target;
+  // motor.target = motor.target+0.03;
+
+  // iterative setting of the FOC phase voltage
+  motor.loopFOC();
+
+  // iterative function setting the outter loop target
+  // velocity, position or voltage
+  // if target not set in parameter uses motor.target variable
+  motor.move();
+  // delay(100);
+  crsf.loop();
+
+  Serial.print(motor.target);
+  Serial.print('\t');
+  Serial.println(sensor1.getSensorAngle());
+
+  // user communication
+  // command.run();
+}
+
