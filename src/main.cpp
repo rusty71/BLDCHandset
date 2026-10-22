@@ -139,11 +139,22 @@ static uint16_t lat_hist[LAT_HIST];
 //   pilot turns the wheel  ->  handset angle -> ELRS channel -> servo
 //   servo position         ->  ELRS telemetry -> handset -> wheel follows
 //
-// The wheel is position locked to the servo's reported position, so the
-// follow gain must keep the loop stable. With the servo's range mapped 1:1
-// onto the channel and the wheel's angle mapped onto the same channel, the
-// loop gain is FOLLOW_GAIN_RAD * 2 * (1000/6) / 1000 = FOLLOW_GAIN_RAD/3,
-// so anything below 3 rad is stable. The default is a long way below that.
+// Both motors run the same SimpleFOC position loop. The only difference is
+// where the setpoint comes from:
+//
+//   servo   : motor.target = its calibrated travel scaled by the channel,
+//             and the channel carries the wheel's sensor angle.
+//   handset : motor.target = the servo's calibrated travel scaled by
+//             follow_gain_rad, and that travel arrives in the telemetry.
+//
+// So each motor's position command is literally the other board's sensor
+// reading, relayed over ELRS. One full turn of the wheel is mapped onto the
+// servo's measured travel, which is why the two track each other one to one.
+//
+// The loop is stable because the servo's travel is clamped onto the channel
+// (target = 1500 + angle/PI*500, clamped at +-PI) and the same travel is the
+// wheel's target: at the ends both ends are pinned, and with the offset below
+// subtracted the gain is exactly one in between, i.e. neutral, like a shaft.
 //
 // motor.sensor_offset was set to the angle the motor booted at, so 0 means
 // "stay where we booted" and the trim is an offset from there.
@@ -156,13 +167,30 @@ static uint16_t lat_hist[LAT_HIST];
 #define FOLLOW_GAIN_LIMIT       FOLLOW_GAIN_FULL_TURN
 
 float motor_target_rad = 0.0f;      // manual trim, from the menu
-// rad of wheel per unit of servo position. Zero by default: the wheel is the
-// master and the servo follows it. A gain of PI makes the wheel follow the
-// servo one-to-one, but the servo follows the wheel too, so that is a
-// positive feedback loop with unity gain and it runs away.
-float follow_gain_rad = 0.0f;
+// rad of wheel per unit of servo position. PI makes the wheel follow the
+// servo one-to-one, which is what couples the two positions: one full turn of
+// the wheel is exactly the servo's calibrated travel. The loop gain is
+// follow_gain / PI, so PI is unity - neutral, like a real shaft, and stable
+// only because the two positions are clamped at the ends of the travel. Small
+// gains act like a spring back to the boot position instead.
+float follow_gain_rad = (float)PI;
 float servo_position = 0.0f;        // -1 .. +1, from the servo's telemetry
 uint32_t servo_position_ts = 0;
+
+// The wheel's target is whatever the servo's telemetry says, so any constant
+// offset in that number is integrated by the unity-gain loop and the wheel
+// creeps until it reaches a stop. The offset comes from the servo sitting a
+// fraction of a count off the middle of its travel (the channel is 11 bit, so
+// 1500 us is 991.5 counts) and from its own settling. Measure it while the
+// wheel sits at its boot position and subtract it.
+float servo_position_zero = 0.0f;
+static bool servo_zero_valid = false;
+static uint32_t servo_zero_timer = 0;
+
+// The coupling only starts once the offset is known. Until then the wheel must
+// stay on its mark, because the offset itself is what moves it: applying the
+// follow first would walk the wheel away before it could be measured.
+static bool follow_enabled = false;
 
 static int32_t last_offset_us = 0;  // measured CRSF shot phase error
 static bool    phase_enabled = true;      // runtime switch, menu 'x'
@@ -289,12 +317,12 @@ static ParamSlot *paramById(uint8_t id)
 // CRSF callbacks
 // ---------------------------------------------------------------------------
 
-// The servo reports its position in the battery sensor frame's voltage field,
-// in the raw CRSF channel scale: 172 = servo at min_angle, 1811 = servo at
-// max_angle, the midpoint = servo at centre_angle.
 // The servo answers in the battery sensor frame:
-//   voltage : the servo's own position, raw CRSF channel scale
+//   voltage : the servo's own position, 0 = min stop, 65535 = max stop
 //   current : the token it received, echoed back
+// The full 16 bit field is used instead of the 11 bit CRSF channel scale: the
+// follow loop is unity gain, so every quantisation step in the position it
+// receives becomes a permanent position error that the loop integrates.
 // The radio sends link statistics (0x14), so this tells us whether the ELRS
 // link to the receiver is actually up.
 static void linkStats(crsfLinkStatistics_t *ls)
@@ -352,9 +380,10 @@ void vbatMessage(crsf_sensor_battery_t *vbatSensor){
   uint16_t pos_raw = be16toh((uint16_t)vbatSensor->voltage);
   uint16_t token   = be16toh((uint16_t)vbatSensor->current);
 
-  float mid = (CRSF_CHANNEL_VALUE_MIN + CRSF_CHANNEL_VALUE_MAX) / 2.0f;
-  float half = (CRSF_CHANNEL_VALUE_MAX - CRSF_CHANNEL_VALUE_MIN) / 2.0f;
-  servo_position = ((float)pos_raw - mid) / half;      // -1 .. +1
+  // 0 = servo at its min stop, 65535 = max stop, 32767.5 = centre. The whole
+  // 16 bit field is used because the follow loop is unity gain: any
+  // quantisation left here is integrated and walks the wheel.
+  servo_position = ((float)pos_raw - 32767.5f) / 32767.5f;   // -1 .. +1
   servo_position_ts = millis();
 
   // Match the token against the moment we sent it
@@ -467,13 +496,19 @@ static void printHelp()
     Serial.println("  r <id>     read parameter <id>");
     Serial.println("  d          show link / timing status");
     Serial.println("  p          show the motor target angle");
-    Serial.println("  p <deg>    set the motor trim angle (from the boot position)");
+    Serial.println("  p <deg>    set the motor trim angle (use g 0 first: the trim");
+    Serial.println("             and the coupling fight each other)");
+    Serial.println("  o          re-measure the servo position offset and couple");
+    Serial.println("  v <volts>  motor torque limit (0.5 .. 12, default 4 = light)");
+    Serial.println("  q <P>      position gain (default 15: higher follows faster)");
     Serial.println("  z          clear the latency statistics");
     Serial.println("  x          toggle the CRSF shot phase correction");
     Serial.println("  f <us>     force the channel frame interval (f 0 = follow the radio)");
     Serial.println("  g          show the servo follow gain");
-    Serial.println("  g <gain>   set the servo follow gain (rad of wheel per unit)");
+    Serial.println("  g <gain>   set the servo follow gain (rad of wheel per unit,");
+    Serial.println("             0 = uncoupled, 3.14 = one-to-one coupling)");
     Serial.println("  a          toggle the automatic Telemetry Ratio setup");
+    Serial.println("  s <us>     force the channel to <us> to park the servo (0 = off)");
     Serial.println("  h          this help");
     Serial.println();
 }
@@ -672,6 +707,10 @@ static void printStatus()
 static char cmdBuf[64];
 static uint8_t cmdLen = 0;
 
+// Test aid: force the channel to a fixed value so the servo can be parked at
+// a known position and the wheel's answer to it observed. 0 = normal.
+static float channel_override_us = 0.0f;
+
 static void handleCommand(char *line)
 {
     while (*line == ' ') line++;
@@ -771,6 +810,93 @@ static void handleCommand(char *line)
             Serial.print("  servo follow gain: ");
             Serial.print(follow_gain_rad);
             Serial.println(" rad per unit");
+        }
+    }
+    else if (line[0] == 'v' && (line[1] == ' ' || line[1] == 0))
+    {
+        if (line[1] == ' ')
+        {
+            char *end = NULL;
+            double volts = strtod(line + 2, &end);
+            if (end != NULL && end != line + 2)
+            {
+                if (volts < 0.5) volts = 0.5;
+                if (volts > 12.0) volts = 12.0;
+                motor.voltage_limit = (float)volts;
+                Serial.print("  motor voltage limit set to ");
+                Serial.print(volts);
+                Serial.println(" V (higher = stiffer, heavier to turn)");
+            }
+            else
+                Serial.println("  usage: v <volts>");
+        }
+        else
+        {
+            Serial.print("  motor voltage limit: ");
+            Serial.print(motor.voltage_limit);
+            Serial.println(" V");
+        }
+    }
+    else if (line[0] == 'q' && (line[1] == ' ' || line[1] == 0))
+    {
+        if (line[1] == ' ')
+        {
+            char *end = NULL;
+            double p = strtod(line + 2, &end);
+            if (end != NULL && end != line + 2)
+            {
+                if (p < 0.5) p = 0.5;
+                if (p > 50.0) p = 50.0;
+                motor.P_angle.P = (float)p;
+                Serial.print("  position gain P_angle set to ");
+                Serial.println(motor.P_angle.P);
+            }
+            else
+                Serial.println("  usage: q <P_angle>");
+        }
+        else
+        {
+            Serial.print("  position gain P_angle: ");
+            Serial.println(motor.P_angle.P);
+        }
+    }
+    else if (strcmp(line, "o") == 0 || strcmp(line, "zero") == 0)
+    {
+        servo_position_zero = servo_position;
+        servo_zero_valid = true;
+        follow_enabled = true;
+        Serial.print("  servo zero offset set to ");
+        Serial.print(servo_position_zero, 4);
+        Serial.println(" - the two positions are now coupled");
+    }
+    else if (line[0] == 's' && (line[1] == ' ' || line[1] == 0))
+    {
+        if (line[1] == ' ')
+        {
+            char *end = NULL;
+            double us = strtod(line + 2, &end);
+            if (end != NULL && end != line + 2 && us >= 0.0)
+            {
+                if (us > 0.0 && us < 1000.0) us = 1000.0;
+                if (us > 2000.0) us = 2000.0;
+                channel_override_us = (float)us;
+                if (us == 0.0)
+                    Serial.println("  channel follows the wheel");
+                else
+                {
+                    Serial.print("  channel forced to ");
+                    Serial.print(us);
+                    Serial.println(" us (the wheel angle is ignored)");
+                }
+            }
+            else
+                Serial.println("  usage: s <us>   (0 = follow the wheel)");
+        }
+        else
+        {
+            Serial.print("  channel override: ");
+            if (channel_override_us > 0.0f) { Serial.print(channel_override_us); Serial.println(" us"); }
+            else Serial.println("off");
         }
     }
     else if (line[0] == 'p' && (line[1] == ' ' || line[1] == 0))
@@ -1027,7 +1153,17 @@ void setup() {
   motor.PID_velocity.P = 0.2;
   motor.PID_velocity.I =10;
   motor.PID_velocity.D = 0.0;
-  motor.voltage_limit = 12;
+  // The wheel has to be light to turn. P_angle is the stiffness of the
+  // position lock: at the SimpleFOC default of 20 a small lag (the servo's
+  // position always arrives one round trip late) turns into a big velocity
+  // setpoint and the motor fights the hand. The voltage limit caps the peak
+  // torque on top of that. Both are menu-tunable: 'v <volts>'.
+  // Keep the wheel's *torque* low (light) but its *position gain* high: a
+  // high P_angle means it starts moving on a small error, the voltage limit
+  // caps how hard it can push. That is what lets it keep up with the servo
+  // when the servo is back-driven, without fighting the hand.
+  motor.P_angle.P = 15.0f;
+  motor.voltage_limit = 4.0f;
   motor.LPF_velocity.Tf = 0.01;
 
   motor.init();
@@ -1065,12 +1201,58 @@ void loop() {
 
   // FOC: commutate the motor and hold its position. This has to run every
   // iteration - without it the motor is never commutated and never held.
-  // The wheel holds the trim. follow_gain_rad (menu 'g') optionally adds the
-  // servo's reported position on top of that.
-  motor.target = motor_target_rad + follow_gain_rad * servo_position;
+  // Both motors run SimpleFOC position control. The wheel's setpoint is the
+  // servo's sensor angle as it arrives over the ELRS telemetry: one full turn
+  // of the wheel is mapped onto the servo's calibrated travel, so the two
+  // positions track each other. A constant offset in that telemetry would be
+  // integrated by the unity-gain loop and walk the wheel to a stop, so it is
+  // measured at boot (see servo_position_zero).
+  // Note: no derivative term on the servo position. Feeding the wheel's own
+  // velocity back into the target makes the motor buzz at high frequency - the
+  // velocity estimate is noisy and the loop has the RF delay in it.
+  float follow = follow_gain_rad * (servo_position - servo_position_zero);
+  motor.controller = MotionControlType::angle;
+  motor.target = motor_target_rad + (follow_enabled ? follow : 0.0f);
   motor.loopFOC();
   encoderCheckWrap();
   motor.move();
+
+  // Learn the servo's zero while the wheel is parked at its boot position: the
+  // servo is then commanded to 1500 us, so the position it reports is the
+  // offset to subtract. The servo only answers once its own boot is finished,
+  // and it finishes on its centre, so the first stable telemetry is the right
+  // moment. Skipped after the first success, and redoable from the menu 'o'.
+  {
+    static float window_start = 0.0f;
+    bool fresh = servo_position_ts != 0 && (uint32_t)(millis() - servo_position_ts) < 200;
+    // The wheel is on its zero, so the servo is being commanded 1500 us, i.e.
+    // its centre: require it to actually be near the centre as well, or the
+    // offset is sampled while the servo is still on its way there.
+    bool parked = fabsf(motor.shaft_angle) < 0.05f && motor_target_rad == 0.0f &&
+                  fabsf(servo_position) < 0.15f;
+    if (!servo_zero_valid && fresh && parked)
+    {
+      // Re-baseline whenever the servo moves: right after its own boot it is
+      // still settling towards the centre, and the offset has to be taken
+      // once it is actually there.
+      if (servo_zero_timer == 0 || fabsf(servo_position - window_start) >= 0.005f)
+      {
+        servo_zero_timer = millis();
+        window_start = servo_position;
+      }
+      else if ((uint32_t)(millis() - servo_zero_timer) > 600)
+      {
+        servo_position_zero = servo_position;
+        servo_zero_valid = true;
+        follow_enabled = true;
+        Serial.print("  servo zero offset measured: ");
+        Serial.print(servo_position_zero, 4);
+        Serial.println(" - the two positions are now coupled");
+      }
+    }
+    else if (!fresh || !parked)
+      servo_zero_timer = 0;
+  }
 
   crsf.loop();
   pollConsole();
@@ -1089,7 +1271,9 @@ void loop() {
     Serial.print(" bytes=");
     Serial.print(crsf.bytesReceived());
     Serial.print(" link=");
-    Serial.print(crsf.isLinkUp() ? "up" : "down");
+    // linkIsUp(), not crsf.isLinkUp(): this module relays 0x14 link
+    // statistics unreliably, but fresh servo telemetry proves the link.
+    Serial.print(linkIsUp() ? "up" : "down");
     Serial.print(" servo_pos=");
     Serial.print(servo_position, 3);
     Serial.print(" age=");
@@ -1116,17 +1300,18 @@ void loop() {
     // Map one full turn of the wheel onto the servo's calibrated travel, with
     // the boot position in the middle of that travel: -180 deg is the servo's
     // min stop, 0 deg its centre and +180 deg its max stop.
-    float turn = fmodf(angle, 2.0f * PI);
-    if (turn < 0.0f)
-      turn += 2.0f * PI;
-    float frac = turn / (2.0f * PI) + 0.5f;      // 0.5 at boot, wraps at 1.5
-    target = 1000.0f + frac * 1000.0f;
-    if (target >= 2000.0f)
-      target -= 1000.0f;                          // wrap into the channel range
-    if(target < 1000)
-      target = 1000;
-    if(target > 2000)
-      target = 2000;
+    //
+    // Clamped, not wrapped. A wrapped channel has one seam where it jumps
+    // from 2000 back to 1000; the servo then has to cross its whole travel in
+    // one step, and because the wheel follows the servo's position back, that
+    // step is fed into the wheel and the pair runs away. Clamping puts the
+    // same limit at +-180 deg, but there the servo just sits on its stop and
+    // the wheel is pulled back, which is stable.
+    if (angle >  PI) angle =  PI;
+    if (angle < -PI) angle = -PI;
+    target = 1500.0f + (angle / PI) * 500.0f;
+    if (channel_override_us > 0.0f)
+      target = channel_override_us;
 
 
 

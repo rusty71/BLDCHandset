@@ -37,17 +37,17 @@ The full loop, forward and back:
                                                 └──────────────┘
 ```
 
-Both motors run in **position mode**:
+Both motors run in **position mode**, coupled both ways:
 
-- the **handset's wheel** is the master: it position-locks to its trim, and its
-  angle is what the channel carries. One full turn of the wheel spans the
-  servo's whole calibrated travel, with the wheel's boot position in the middle
-  of that travel (see [The channel mapping](#the-channel-mapping)).
+- the **handset's wheel** carries its angle as the channel. One full turn of
+  the wheel spans the servo's whole calibrated travel, with the wheel's boot
+  position in the middle of that travel (see
+  [The channel mapping](#the-channel-mapping)).
 - the **servo** position-locks to that channel, over the travel it measured at
   its own boot
-- the servo's reported position can optionally be added to the wheel's target
-  (`g <gain>`), but see [Loop gain](#loop-gain) - at full scale that is a
-  positive feedback loop and it runs away
+- the servo's reported position is added to the wheel's target, so the wheel
+  follows the servo too: turning either one turns the other, like a shaft
+  between them. See [Two-way coupling](#two-way-coupling).
 
 ```
    ELRS radio  ─────── CRSF 420 kbaud ───────►  BLDCHandset (RP2040)
@@ -205,9 +205,14 @@ baud). The prompt is `>`, and `h` prints the help:
 > r <id>     read parameter <id>
 > d          show link / timing status
 > p          show the motor trim angle
-> p <deg>    set the motor trim angle (from the boot position)
+> p <deg>    set the motor trim angle (use g 0 first - see 'g')
+> o          re-measure the servo position offset and couple the two
+> v <volts>  motor torque limit (0.5 .. 12, default 4 = light)
+> q <P>      position gain (default 15: higher follows faster)
 > g          show the servo follow gain
 > g <gain>   set the servo follow gain (rad of wheel per unit, 0 .. 6.28)
+>            (0 = uncoupled, 3.14 = one-to-one)
+> s <us>     force the channel to <us> to park the servo (0 = off)
 > a          toggle the automatic Telemetry Ratio setup
 > z          clear the latency statistics
 > x          toggle the CRSF shot phase correction
@@ -275,27 +280,35 @@ motor.target  ->  P_angle(target - motor.shaft_angle)  ->  velocity setpoint
 The target is the trim, optionally plus the servo's reported position:
 
 ```cpp
-motor.target = motor_target_rad + follow_gain_rad * servo_position;
+motor.target = motor_target_rad +
+               follow_gain_rad * (servo_position - servo_position_zero);
 ```
 
 `servo_position` is `-1 .. +1`, decoded from the telemetry frame the servo
-sends (see below). `follow_gain_rad` defaults to **0**, which makes the wheel
-the master: it holds the trim and the servo follows the wheel's angle. The trim
-and the gain are set from the menu (`p <deg>` and `g <gain>`); see
-[Loop gain](#loop-gain) for why the gain starts at zero.
+sends (see below), and `servo_position_zero` is the offset measured at boot
+(see [Two-way coupling](#two-way-coupling)). `follow_gain_rad` defaults to
+**PI**, which makes the wheel follow the servo one-to-one over its calibrated
+travel, while the servo follows the wheel's angle. The trim and the gain are
+set from the menu (`p <deg>` and `g <gain>`).
+
+So each motor's setpoint is the other board's sensor reading, relayed over
+ELRS: the servo's target is `its travel scaled by the wheel's encoder angle`
+and the wheel's target is `the servo's encoder angle scaled by PI`. Both
+motors run the same SimpleFOC angle loop; only the source of the setpoint
+differs.
 
 ### The channel mapping
 
 The channel carries the wheel's angle **measured from where it booted**, not
 the raw encoder angle (whose zero is arbitrary and differs from board to
-board). It is wrapped to one turn and offset by half a turn, so the boot
-position sits in the *middle* of the servo's travel:
+board). One full turn of the wheel is the servo's whole travel, with the boot
+position in the *middle* of that travel:
 
 ```cpp
-float turn = fmodf(motor.shaft_angle, 2*PI);   // 0 .. 2*PI, 0 at boot
-if (turn < 0) turn += 2*PI;
-float frac = turn / (2*PI) + 0.5;              // 0.5 at boot
-target = 1000 + frac * 1000;                   // wraps back at frac = 1.5
+float angle = motor.shaft_angle;      // radians, 0 at boot
+if (angle >  PI) angle =  PI;         // clamp at +-180 deg
+if (angle < -PI) angle = -PI;
+target = 1500 + (angle / PI) * 500;   // 1000 .. 2000 us
 ```
 
 | wheel (from boot) | channel | servo |
@@ -304,31 +317,42 @@ target = 1000 + frac * 1000;                   // wraps back at frac = 1.5
 |  -90 deg | 1250 us | 25 % of travel |
 |    0 deg | 1500 us | `center_angle` |
 |  +90 deg | 1750 us | 75 % of travel |
-| +179 deg | 1996 us | `max_angle` (stop) |
+| +180 deg | 2000 us | `max_angle` (stop) |
 
-Measured on hardware against the bench servo (travel 103.9 deg): 1500 us gave
-2.1228 rad, 1749 us gave 2.5760 rad and 1250 us gave 1.6713 rad - the table
+Measured on hardware against the bench servo (travel 104.6 deg): 1500 us gave
+2.1120 rad, 1599 us gave 2.2948 rad and 1399 us gave 1.9297 rad - the table
 above, to within the channel quantisation.
 
-A circle cannot be mapped continuously onto a limited travel, so there is one
-seam: at +180 deg the channel wraps from 2000 back to 1000 and the servo jumps
-from its max stop to its min stop. The seam is deliberately placed opposite
-the boot position, where the wheel is least likely to be held.
+The mapping is **clamped, not wrapped**. A circle cannot be mapped
+continuously onto a limited travel, so a wrapped channel has one seam where it
+jumps from 2000 back to 1000 and the servo has to cross its entire travel in
+one step. With the wheel following the servo's position back, that step is fed
+straight into the wheel as a 180 deg jolt. Clamping puts the same limit at
++-180 deg, but there the servo simply sits on its stop and the wheel is pulled
+back, so the pair has smooth virtual end stops instead of a seam.
 
 ### The position telemetry
 
-The servo reports its position in the **battery sensor frame** (`0x08`), in
-the raw CRSF channel scale:
+The servo reports its position in the **battery sensor frame** (`0x08`), using
+the whole 16 bit voltage field:
 
 | raw value | servo position |
 | --------- | -------------- |
-| `CRSF_CHANNEL_VALUE_MIN` (172) | `min_angle` |
-| `CRSF_CHANNEL_VALUE_MAX` (1811) | `max_angle` |
-| the midpoint (991) | `center_angle` |
+| `0` | `min_angle` |
+| `65535` | `max_angle` |
+| `32767` / `32768` | `center_angle` |
 
-The handset decodes it with the same constants and converts it to `-1 .. +1`
-around the middle. The frame's values are big endian on the wire, so the
-little-endian bitfield read is swapped back with `be16toh()`.
+The handset decodes it as `(raw - 32767.5) / 32767.5` to `-1 .. +1`. The
+frame's values are big endian on the wire, so the little-endian bitfield read
+is swapped back with `be16toh()`.
+
+The full 16 bits are used because the coupling loop is **unity gain**: every
+quantisation step left in this number becomes a permanent position error,
+which the loop integrates. At the 11 bit CRSF channel scale one step was
+0.0018 of the travel = 0.006 rad of wheel, and the wheel crawled away from
+where it was left within seconds (measured: 0 to -0.40 rad in 20 s, and 1.5
+rad in 35 s on another boot). At 16 bit a step is 0.00003 of the travel,
+which is below the encoder's own resolution.
 
 The frame's `current` field carries the **latency token** (see below).
 
@@ -382,11 +406,11 @@ sketch treats **fresh servo telemetry** as the sign that the link is up
 (`linkIsUp()`). That matters for the automatic Telemetry Ratio setup, which
 otherwise waits forever for a frame that never arrives.
 
-### Loop gain
+### Two-way coupling
 
 The wheel commands the servo (its angle is the channel) and the servo's
-reported position can command the wheel back. That second path closes a loop
-around the RF link:
+reported position commands the wheel back. The two paths close a loop around
+the RF link:
 
 ```
 wheel angle -> channel -> servo target -> servo position -> wheel target
@@ -401,21 +425,65 @@ target therefore comes back by
 d(target)/d(wheel) = (travel / 2*PI) * (2 / travel) * follow_gain = follow_gain / PI
 ```
 
-so the loop gain is `follow_gain / PI` - and it is **positive** feedback: the
-wheel moves the servo, and the servo commands the wheel further in the same
-direction. At the full-circle gain of PI the loop gain is exactly 1 and the
-wheel accelerates away. Measured on hardware, leaving `g` at the full-circle
-default drove the wheel from -26 rad to -103 rad in a few seconds.
+so the loop gain is `follow_gain / PI`. At `follow_gain = PI` that is exactly
+1: each motor holds the position the other one reports, and the pair behaves
+like a shaft between them - **neutral**, so it stays wherever it is put.
 
-`follow_gain_rad` therefore defaults to **0**: the wheel is the master and the
-servo follows it. Small gains are usable - the closed-loop gain is
-`1 / (1 - follow_gain/PI)`, so 0.5 rad per unit amplifies the wheel's motion by
-about 19 % - but anything approaching PI is unusable.
+That equality has to hold to much better than a percent, because at unity the
+loop integrates any error it is given. Two things break the equality, and both
+are handled:
 
-For the wheel to track the servo at full scale the feedback has to be
-**negative** (`g -3.14`): the loop gain becomes -1, the pair behaves as a
-stiff, well-damped linkage, and turning the wheel commands the servo the
-other way.
+1. **A constant offset.** The servo is commanded 1500 us, which is 991.5
+   channel counts, and it settles wherever its own loop leaves it - a fraction
+   of a count away from the middle of its travel. So the position it reports
+   when the wheel is on its boot mark is not exactly `0`. At unity gain a
+   constant offset is integrated: the wheel creeps away from where it was left
+   and only stops when something else pins it. The handset therefore measures
+   the offset at boot - the wheel is parked on its zero, so the servo is being
+   commanded its centre and whatever it reports is the offset - and subtracts
+   it. The coupling only starts once the offset is known, because until then
+   the offset itself is what would move the wheel. `o` re-measures it.
+
+2. **Quantisation in the feedback.** See
+   [The position telemetry](#the-position-telemetry): the position report is
+   16 bit for exactly this reason. At 11 bit the residual after the offset
+   measurement was still one step, which is a permanent 0.006 rad error of
+   wheel - the loop walked it to a stop.
+
+3. **A seam in the channel.** See
+   [The channel mapping](#the-channel-mapping): clamped, not wrapped.
+
+Measured on the pair after those three fixes:
+
+| test | result |
+| ---- | ------ |
+| servo parked at 1600 us (+20 % travel) | wheel to **+0.63 rad**, in ~0.3 s, then held |
+| servo parked at 1400 us (-20 % travel) | wheel to **-0.62 rad** |
+| servo parked at 1500 us (centre) | wheel to **0.00 rad** |
+| wheel left alone for 40 s, coupled | **0.00 rad, no drift** |
+| wheel left alone for 30 s at -2.92 rad | **-2.92 rad, no drift** |
+| `p 10` pulsed for 0.8 s (a push, then release) | wheel **+0.80 rad**, servo followed 1574 -> 1701 us, wheel **stayed** at the new position after the release |
+| `s 2000 / 1000 / 1500` sweep | +3.14 / -3.14 / 0.00 rad, no seam |
+
+The handset's own angle is the one transmitted, so the forward direction is
+the direct one; the reverse direction is the servo's telemetry closing the
+loop. A 20 % servo travel maps to a 20 % wheel turn (72 deg of wheel), i.e.
+the servo's full 104 deg stroke is the wheel's full turn.
+
+The two directions do not have the same bandwidth, and that is what the
+servo's stiffness controls (its menu `v` and `q`):
+
+* Turning the **servo** by hand: its sensor moves, the wheel's target moves,
+  and the wheel (light, 4 V) follows in ~0.3 s.
+* Turning the **wheel** by hand: its sensor moves, the servo's target moves,
+  and the servo has to get there. If it is too soft (6 V / P_angle 8 was
+  tried) the wheel's own position loop pulls back before the servo arrives and
+  the pair does not appear to move at all. 12 V / P_angle 20 (the default) is
+  fast enough.
+
+`g 0` uncouples the two (the wheel then holds its trim, `p <deg>`); `g` values
+between 0 and PI make the wheel spring back towards its boot position instead
+of tracking the servo, so the default is PI.
 
 Two things are needed for the position lock to work at all:
 
@@ -495,56 +563,39 @@ register dump), `spi_mode_test.cpp` (SPI mode comparison) and `foc_chain.cpp`
 
 ## Known issues
 
-These are real, verified from the code and the captured traces. They are
-**not** fixed here because each needs hardware validation.
+1. **The battery telemetry is hijacked.** The `0x08` frame carries the servo
+   position in its voltage field, so the radio's battery readout shows a
+   nonsense voltage. Reporting both would need a second telemetry frame.
 
-1. **The phase controller has never been validated on hardware.** The
-   correction is now applied to the transmit phase (as the TBS spec intends)
-   and the setpoint is the radio's own measurement, but the captures are from
-   2024-11-01 and predate this change. Re-capture and confirm the published
-   `offset` converges towards zero, and tune `PHASE_KP` / `PHASE_KI` /
-   `PHASE_LIMIT` in `src/main.cpp` if it does not.
+2. **All channels except 1 and 2 are forced to "stick low".** `ch3...ch15` are
+   set to 1 and `ch0` is left at 0, so any other input on those channels is
+   lost. This device is the only CRSF source on its bus, so in practice
+   nothing else is lost, but it would not work alongside real stick inputs.
 
-2. **Channel values are written in the wrong scale.** `channels.ch1 = target`
-   puts **microseconds** (1000-2000) into an 11-bit field that CRSF defines as
-   a *raw* value (172 = 988 us ... 1811 = 2012 us). The captured traces show
-   the field correctly carrying raw values 172...1811, so the current source
-   regressed. Fix with
-   `map(target, 988, 2012, CRSF_CHANNEL_VALUE_MIN, CRSF_CHANNEL_VALUE_MAX)`.
+3. **`down_lq` reads 0 %.** This ELRS module does not report a downlink LQ, so
+   the link statistics frame carries zeros there. The uplink LQ and RSSI are
+   real.
 
-3. **All 16 channels are overwritten.** `ch0` is never assigned (so it is 0 =
-   stick low) and `ch2...ch15` are set to 1 (= stick low). The radio's real
-   stick inputs are destroyed. The fix is to parse the radio's incoming
-   `0x16` frame - note `CrsfSerial::processPacketIn` only dispatches `0x16`
-   for address `0xC8`, but the radio sends channel frames as `0xEA` - then
-   merge and override only the one channel you own.
+4. **The coupling is neutral, not stiff.** At `follow_gain = PI` the wheel
+   holds whatever position the pair is in; nothing pulls it back to centre,
+   which is how a real shaft behaves. It also has no friction: a small gain
+   error creeps over time. The boot offset measurement cancels the systematic
+   part, and the position telemetry is 16 bit so that its quantisation is
+   below the encoder's resolution (measured: 0.00 rad over 40 s). If the creep
+   comes back after a change in the mechanics, `o` re-measures the offset, and
+   `g` slightly below PI makes the pair self-centre.
 
-4. **The `0x08` payload is not a battery frame.** The sketch reads it as
-   `crsf_sensor_battery_t.voltage`, but the values sit in the raw 11-bit
-   channel range (172...1811) and match the handset's own transmitted channel
-   value in 100 % of 39 403 frames. Whatever the radio is really sending in
-   `0x08`, it is not a battery voltage.
+5. **The trim and the coupling fight each other.** `p <deg>` offsets the
+   wheel's target, and at unity loop gain a constant offset is integrated, so
+   the wheel runs to a stop. Use `g 0` first if the wheel has to be moved from
+   the menu. A *pulsed* `p` (set it, wait, set it back to 0) is a convenient
+   way to push the wheel from the console for tests: it is a torque pulse.
 
-5. **`motor.loopFOC()` / `motor.move()` are never called.** The motor is only
-   initialised and aligned (`initFOC()`); the sketch is an encoder *reader*.
-
-6. **`motor.sensor_offset = motor.shaft_angle;` is a no-op** - it runs before
-   `motor.init()`, so `shaft_angle` is still 0. SimpleFOC 2.3.x uses
-   `zero_electric_angle` instead.
-
-7. **The debug port is flooded.** `vbatMessage()` prints `.` for every received
-   battery frame (125 Hz) onto the same 115200-baud port used for the
-   angle/target trace and the menu.
-
-8. **No catch-up clamp on the TX scheduler.** `channelstime += period`
-   accumulates nominal rather than elapsed time, so an overrun makes the
-   sketch fire frames back-to-back to catch up.
-
-9. **The handset is probably not on the radio's CRSF handset port.** ELRS
-   rewrites byte 0 to `0xC8` on that port (`CRSFHandset::forwardMessage`),
-   but the captures show `addr=EA` for received frames. The parameter
-   requests in `lib/CrsfSerial` therefore try `dest_addr = 0xEE` and fall
-   back to broadcast; confirm which connector the board is really on.
+6. **The two directions have different bandwidth.** The reverse direction
+   (turning the wheel, so the servo has to chase the channel) needs the servo
+   to reach its new setpoint before the wheel's own position loop pulls the
+   wheel back. That is why the servo runs at 12 V / P_angle 20 by default; its
+   `v` and `q` commands trade that against how hard it is to back-drive.
 
 ---
 
