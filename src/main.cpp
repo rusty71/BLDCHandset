@@ -149,10 +149,18 @@ static uint16_t lat_hist[LAT_HIST];
 // "stay where we booted" and the trim is an offset from there.
 // ---------------------------------------------------------------------------
 #define MOTOR_TARGET_LIMIT_DEG  180.0f
-#define FOLLOW_GAIN_LIMIT       3.0f
+// The servo reports its position over its own calibrated travel as -1 .. +1.
+// A gain of PI therefore sweeps the wheel through 2*PI rad, i.e. exactly one
+// full turn, for the servo's whole travel.
+#define FOLLOW_GAIN_FULL_TURN   (2.0f * (float)PI)
+#define FOLLOW_GAIN_LIMIT       FOLLOW_GAIN_FULL_TURN
 
 float motor_target_rad = 0.0f;      // manual trim, from the menu
-float follow_gain_rad = 0.5f;       // rad of wheel per unit of servo position
+// rad of wheel per unit of servo position. Zero by default: the wheel is the
+// master and the servo follows it. A gain of PI makes the wheel follow the
+// servo one-to-one, but the servo follows the wheel too, so that is a
+// positive feedback loop with unity gain and it runs away.
+float follow_gain_rad = 0.0f;
 float servo_position = 0.0f;        // -1 .. +1, from the servo's telemetry
 uint32_t servo_position_ts = 0;
 
@@ -620,7 +628,9 @@ static void printStatus()
     Serial.println(" deg from the boot position");
     Serial.print("  servo follow gain   : ");
     Serial.print(follow_gain_rad);
-    Serial.println(" rad per unit");
+    Serial.print(" rad per unit (");
+    Serial.print(follow_gain_rad * 2.0f * 180.0f / PI);
+    Serial.println(" deg of wheel over the servo's full travel)");
     Serial.print("  crsf frames/bytes   : ");
     Serial.print(crsf.framesReceived());
     Serial.print(" / ");
@@ -738,8 +748,11 @@ static void handleCommand(char *line)
     {
         if (line[1] == ' ')
         {
-            float gain = 0.0f;
-            if (sscanf(line + 2, "%f", &gain) == 1)
+            // strtod, not sscanf("%f"): this newlib build has no float
+            // scanf support, so sscanf always failed and "g 0" was rejected.
+            char *end = NULL;
+            double gain = strtod(line + 2, &end);
+            if (end != NULL && end != line + 2)
             {
                 if (gain < 0.0f) gain = 0.0f;
                 if (gain > FOLLOW_GAIN_LIMIT) gain = FOLLOW_GAIN_LIMIT;
@@ -764,8 +777,9 @@ static void handleCommand(char *line)
     {
         if (line[1] == ' ')
         {
-            float deg = 0.0f;
-            if (sscanf(line + 2, "%f", &deg) == 1)
+            char *end = NULL;
+            double deg = strtod(line + 2, &end);
+            if (end != NULL && end != line + 2)
             {
                 if (deg < -MOTOR_TARGET_LIMIT_DEG) deg = -MOTOR_TARGET_LIMIT_DEG;
                 if (deg >  MOTOR_TARGET_LIMIT_DEG) deg =  MOTOR_TARGET_LIMIT_DEG;
@@ -1051,8 +1065,8 @@ void loop() {
 
   // FOC: commutate the motor and hold its position. This has to run every
   // iteration - without it the motor is never commutated and never held.
-  // Hold the trim plus whatever the servo reports, so the wheel follows the
-  // servo's actual position.
+  // The wheel holds the trim. follow_gain_rad (menu 'g') optionally adds the
+  // servo's reported position on top of that.
   motor.target = motor_target_rad + follow_gain_rad * servo_position;
   motor.loopFOC();
   encoderCheckWrap();
@@ -1094,14 +1108,21 @@ void loop() {
   if ((int32_t)(now - tx_at) >= 0) {                    // now >= tx_at
     //send channels
     sensor1.update();
-    angle = sensor1.getAngle();
-    // Map the absolute sensor angle over one full turn onto the channel
-    // range. The encoder reports wrapped angles, so normalise to 0..2*pi
-    // first - a fixed window would clamp the ends and lose travel.
+    // The wheel's angle relative to where it booted, not the raw encoder
+    // angle: the encoder's zero is arbitrary and differs from board to board,
+    // so using it directly would put the boot position at an arbitrary point
+    // of the servo's travel.
+    angle = motor.shaft_angle;
+    // Map one full turn of the wheel onto the servo's calibrated travel, with
+    // the boot position in the middle of that travel: -180 deg is the servo's
+    // min stop, 0 deg its centre and +180 deg its max stop.
     float turn = fmodf(angle, 2.0f * PI);
     if (turn < 0.0f)
       turn += 2.0f * PI;
-    target = 1000.0f + (turn / (2.0f * PI)) * 1000.0f;
+    float frac = turn / (2.0f * PI) + 0.5f;      // 0.5 at boot, wraps at 1.5
+    target = 1000.0f + frac * 1000.0f;
+    if (target >= 2000.0f)
+      target -= 1000.0f;                          // wrap into the channel range
     if(target < 1000)
       target = 1000;
     if(target > 2000)

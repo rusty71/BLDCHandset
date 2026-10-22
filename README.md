@@ -26,8 +26,8 @@ The full loop, forward and back:
   │  AS5048A ─► angle │                              │  air
   │                   │                              ▼
   │                   │                       ┌──────────────┐
-  │  BLDC ◄─ follows  │ ◄── 0x08 telemetry ────│ ELRS receiver│
-  │  the servo        │      (via the radio)  │              │
+  │  BLDC ── holds    │ ◄── 0x08 telemetry ────│ ELRS receiver│
+  │  the wheel angle  │      (via the radio)  │              │
   └───────────────────┘                       └──────┬───────┘
                                                        │ 0x16 RC channels
                                                        ▼
@@ -39,8 +39,15 @@ The full loop, forward and back:
 
 Both motors run in **position mode**:
 
-- the **servo** position-locks to the channel the handset injected
-- the **handset's wheel** position-locks to the position the servo reports back
+- the **handset's wheel** is the master: it position-locks to its trim, and its
+  angle is what the channel carries. One full turn of the wheel spans the
+  servo's whole calibrated travel, with the wheel's boot position in the middle
+  of that travel (see [The channel mapping](#the-channel-mapping)).
+- the **servo** position-locks to that channel, over the travel it measured at
+  its own boot
+- the servo's reported position can optionally be added to the wheel's target
+  (`g <gain>`), but see [Loop gain](#loop-gain) - at full scale that is a
+  positive feedback loop and it runs away
 
 ```
    ELRS radio  ─────── CRSF 420 kbaud ───────►  BLDCHandset (RP2040)
@@ -200,7 +207,7 @@ baud). The prompt is `>`, and `h` prints the help:
 > p          show the motor trim angle
 > p <deg>    set the motor trim angle (from the boot position)
 > g          show the servo follow gain
-> g <gain>   set the servo follow gain (rad of wheel per unit, 0 .. 3)
+> g <gain>   set the servo follow gain (rad of wheel per unit, 0 .. 6.28)
 > a          toggle the automatic Telemetry Ratio setup
 > z          clear the latency statistics
 > x          toggle the CRSF shot phase correction
@@ -265,15 +272,48 @@ motor.target  ->  P_angle(target - motor.shaft_angle)  ->  velocity setpoint
                ->  loopFOC(): commutation against motor.electricalAngle()
 ```
 
-The target is the **trim plus the servo's reported position**:
+The target is the trim, optionally plus the servo's reported position:
 
 ```cpp
 motor.target = motor_target_rad + follow_gain_rad * servo_position;
 ```
 
 `servo_position` is `-1 .. +1`, decoded from the telemetry frame the servo
-sends (see below). The trim and the follow gain are set from the menu
-(`p <deg>` and `g <gain>`).
+sends (see below). `follow_gain_rad` defaults to **0**, which makes the wheel
+the master: it holds the trim and the servo follows the wheel's angle. The trim
+and the gain are set from the menu (`p <deg>` and `g <gain>`); see
+[Loop gain](#loop-gain) for why the gain starts at zero.
+
+### The channel mapping
+
+The channel carries the wheel's angle **measured from where it booted**, not
+the raw encoder angle (whose zero is arbitrary and differs from board to
+board). It is wrapped to one turn and offset by half a turn, so the boot
+position sits in the *middle* of the servo's travel:
+
+```cpp
+float turn = fmodf(motor.shaft_angle, 2*PI);   // 0 .. 2*PI, 0 at boot
+if (turn < 0) turn += 2*PI;
+float frac = turn / (2*PI) + 0.5;              // 0.5 at boot
+target = 1000 + frac * 1000;                   // wraps back at frac = 1.5
+```
+
+| wheel (from boot) | channel | servo |
+| ----------------- | ------- | ----- |
+| -180 deg | 1000 us | `min_angle` (stop) |
+|  -90 deg | 1250 us | 25 % of travel |
+|    0 deg | 1500 us | `center_angle` |
+|  +90 deg | 1750 us | 75 % of travel |
+| +179 deg | 1996 us | `max_angle` (stop) |
+
+Measured on hardware against the bench servo (travel 103.9 deg): 1500 us gave
+2.1228 rad, 1749 us gave 2.5760 rad and 1250 us gave 1.6713 rad - the table
+above, to within the channel quantisation.
+
+A circle cannot be mapped continuously onto a limited travel, so there is one
+seam: at +180 deg the channel wraps from 2000 back to 1000 and the servo jumps
+from its max stop to its min stop. The seam is deliberately placed opposite
+the boot position, where the wheel is least likely to be held.
 
 ### The position telemetry
 
@@ -344,16 +384,38 @@ otherwise waits forever for a frame that never arrives.
 
 ### Loop gain
 
-The wheel's angle and the servo's angle are mapped onto the same channel, so
-the loop gain is
+The wheel commands the servo (its angle is the channel) and the servo's
+reported position can command the wheel back. That second path closes a loop
+around the RF link:
 
 ```
-loop gain = follow_gain * 2 * (1000 us / 6 rad) / 1000 = follow_gain / 3
+wheel angle -> channel -> servo target -> servo position -> wheel target
 ```
 
-Anything below 3 rad is stable; the default of 0.5 rad gives a loop gain of
-0.17, which is far slower than the RF round trip and therefore comfortably
-stable.
+One full turn of the wheel spans the servo's whole travel, so the servo turns
+`travel / 2*PI` rad per radian of wheel motion, and it reports that as a
+`-1 .. +1` position over its own travel. Per radian of wheel motion the wheel
+target therefore comes back by
+
+```
+d(target)/d(wheel) = (travel / 2*PI) * (2 / travel) * follow_gain = follow_gain / PI
+```
+
+so the loop gain is `follow_gain / PI` - and it is **positive** feedback: the
+wheel moves the servo, and the servo commands the wheel further in the same
+direction. At the full-circle gain of PI the loop gain is exactly 1 and the
+wheel accelerates away. Measured on hardware, leaving `g` at the full-circle
+default drove the wheel from -26 rad to -103 rad in a few seconds.
+
+`follow_gain_rad` therefore defaults to **0**: the wheel is the master and the
+servo follows it. Small gains are usable - the closed-loop gain is
+`1 / (1 - follow_gain/PI)`, so 0.5 rad per unit amplifies the wheel's motion by
+about 19 % - but anything approaching PI is unusable.
+
+For the wheel to track the servo at full scale the feedback has to be
+**negative** (`g -3.14`): the loop gain becomes -1, the pair behaves as a
+stiff, well-damped linkage, and turning the wheel commands the servo the
+other way.
 
 Two things are needed for the position lock to work at all:
 
@@ -401,6 +463,18 @@ Measured on the real board (RP2040 Zero, AS5048A, 7 pole pair motor) with
 
 The wheel is therefore position locked to within a tenth of a degree, and it
 holds position when the target is unchanged.
+
+The **pair** (handset -> radio -> servo) was then checked by commanding the
+wheel with the `p` trim and reading back the servo's own report (bench servo,
+travel 103.9 deg):
+
+| wheel command | channel sent | servo target | servo position |
+| ------------- | ------------ | ------------ | -------------- |
+| `p 0`     | 1500 us | 2.1228 rad (centre) | 2.1230 |
+| `p 90`    | 1750 us | 2.5760 rad (75 %)   | 2.5771 |
+| `p -90`   | 1250 us | 1.6713 rad (25 %)   | 1.6720 |
+| `p 179`   | 1996 us | 3.0239 rad (max)    | 3.0250 |
+| `p -179`  | 1001 us | 1.2198 rad (min)    | 1.2210 |
 
 ### Running the hardware test
 
