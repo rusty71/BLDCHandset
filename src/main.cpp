@@ -4,7 +4,6 @@
 #include "SimpleFOCDrivers.h"
 #include "encoders/as5048a/MagneticSensorAS5048A.h"
 #include <CrsfSerial.h>
-#include <PID_v1.h>
 
 #define SPI_2_MISO  12
 #define SPI_2_MOSI  11
@@ -40,9 +39,32 @@ BLDCMotor motor = BLDCMotor(7);
 BLDCDriver3PWM driver = BLDCDriver3PWM(3, 2, 6, 7);
 CrsfSerial crsf(Serial1, 420000);
 
-int packet_rate = 20000;
-int packet_rate_adj = 0;
-int phase_shift = 0;
+// ---------------------------------------------------------------------------
+// Transmit timing
+//
+// The radio publishes a timing correction frame (TBS spec "0x3A.0x10 Timing
+// Correction (CRSF Shot)"), every 200 ms:
+//
+//   update_interval : the interval it wants us to transmit at
+//   offset          : signed phase error, +ve means our data came too early
+//
+// The radio measures the age of our last frame at the moment of its own RF
+// transmission and publishes the error. Correcting it therefore means
+// shifting our transmit *phase* - the period stays exactly at the requested
+// interval. A PI controller drives the published offset back to zero.
+// ---------------------------------------------------------------------------
+#define PHASE_KP       0.25f    // proportional gain per correction frame
+#define PHASE_KI       0.05f    // integral gain per correction frame
+#define PHASE_LIMIT    2500     // max phase correction in us
+
+int packet_rate = 4000;         // us, from the radio's update_interval
+int phase_correction = 0;       // us, +ve = transmit later
+int phase_integral = 0;         // us, integrator of the phase controller
+uint32_t channelstime = 0;      // nominal transmit schedule (micros() domain)
+
+// Set this to 1 to have the sketch set the radio's Telemetry Ratio to the
+// fastest option as soon as the link comes up.
+#define AUTO_SET_TLM_RATIO  1
 
 // ---------------------------------------------------------------------------
 // ELRS parameter / menu support
@@ -77,6 +99,17 @@ static bool  scanInProgress = false;
 static uint8_t scanNextId = 1;
 static uint8_t scanLastId = 0;
 static uint32_t scanTimer = 0;
+
+enum {
+    AUTO_WAIT_LINK = 0,   // waiting for the CRSF link to come up
+    AUTO_WAIT_INFO,       // pinged, waiting for the device information
+    AUTO_SCANNING,        // walking the parameter table
+    AUTO_DONE
+};
+
+static bool     autoTlmEnabled = AUTO_SET_TLM_RATIO;
+static uint8_t  autoTlmState = AUTO_WAIT_LINK;
+static uint32_t autoTlmTimer = 0;
 
 static void paramsClear()
 {
@@ -234,6 +267,7 @@ static void printHelp()
     Serial.println("  c <id> <v> set parameter <id> to <v>");
     Serial.println("  r <id>     read parameter <id>");
     Serial.println("  d          show link / timing status");
+    Serial.println("  a          toggle the automatic Telemetry Ratio setup");
     Serial.println("  h          this help");
     Serial.println();
 }
@@ -374,9 +408,10 @@ static void printStatus()
     Serial.println();
     Serial.print("  link up           : "); Serial.println(crsf.isLinkUp() ? "yes" : "no");
     Serial.print("  packet rate       : "); Serial.print(packet_rate); Serial.println(" us");
-    Serial.print("  rate adjustment   : "); Serial.print(packet_rate_adj); Serial.println(" us");
-    Serial.print("  phase offset      : "); Serial.print(phase_shift); Serial.println(" (raw)");
+    Serial.print("  phase correction  : "); Serial.print(phase_correction); Serial.println(" us (+ = later)");
+    Serial.print("  phase integrator   : "); Serial.print(phase_integral); Serial.println(" us");
     Serial.print("  parameters found  : "); Serial.println(paramCount);
+    Serial.print("  auto tlm ratio    : "); Serial.println(autoTlmEnabled ? "on" : "off");
     Serial.println();
 }
 
@@ -407,6 +442,14 @@ static void handleCommand(char *line)
     else if (strcmp(line, "t") == 0 || strcmp(line, "tlm") == 0)
     {
         setTelemRatio();
+    }
+    else if (strcmp(line, "a") == 0 || strcmp(line, "auto") == 0)
+    {
+        autoTlmEnabled = !autoTlmEnabled;
+        autoTlmState = AUTO_WAIT_LINK;
+        autoTlmTimer = millis();
+        Serial.print("  automatic Telemetry Ratio setup : ");
+        Serial.println(autoTlmEnabled ? "on" : "off");
     }
     else if (strcmp(line, "d") == 0 || strcmp(line, "status") == 0)
     {
@@ -484,28 +527,97 @@ static void pollScan()
     crsf.sendParamRead(scanNextId++, 0);
 }
 
-double Setpoint, Input, Output;
+// ---------------------------------------------------------------------------
+// Automatic Telemetry Ratio setup
+// ---------------------------------------------------------------------------
 
-double Kp=0.02, Ki=0.1, Kd=0.0;
-PID syncPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, P_ON_M, DIRECT);
+static void pollAutoTlm()
+{
+    if (!autoTlmEnabled || autoTlmState == AUTO_DONE)
+        return;
 
-//needs to be normalized for different packet rates!
-void opentxSyncMessage(crsf_opentx_sync_t *TXsync){
-  packet_rate = (int32_t)htonl(TXsync->packet_inteval)/10;  //micros
-  phase_shift = (int32_t)htonl(TXsync->phase_shift)/10;
-  Input = ((packet_rate/2)-phase_shift);
-  syncPID.Compute();
-  packet_rate_adj = Output;
-#ifdef CRSFSHOT_DEBUG
-  Serial.print(packet_rate+packet_rate_adj);
-  Serial.print('\t');
-  Serial.print((packet_rate/2)-phase_shift);
-  Serial.print('\t');
-  Serial.println((int32_t)htonl(TXsync->phase_shift));
-#endif //CRSFSHOT_DEBUG
+    switch (autoTlmState)
+    {
+    case AUTO_WAIT_LINK:
+        if (crsf.isLinkUp())
+        {
+            Serial.println("  link up, querying ELRS parameters ...");
+            crsf.sendDevicePing(CRSF_ADDRESS_BROADCAST);
+            autoTlmState = AUTO_WAIT_INFO;
+            autoTlmTimer = millis();
+        }
+        else if (millis() - autoTlmTimer > 5000)
+        {
+            // Keep trying - the radio may still be booting
+            autoTlmTimer = millis();
+        }
+        break;
+
+    case AUTO_WAIT_INFO:
+        if (deviceInfoSeen)
+        {
+            autoTlmState = AUTO_SCANNING;
+        }
+        else if (millis() - autoTlmTimer > 2000)
+        {
+            Serial.println("  no answer, retrying ...");
+            crsf.sendDevicePing(CRSF_ADDRESS_BROADCAST);
+            autoTlmTimer = millis();
+        }
+        break;
+
+    case AUTO_SCANNING:
+        if (!scanInProgress)
+        {
+            Serial.println("  parameter table read, applying Telemetry Ratio ...");
+            setTelemRatio();
+            autoTlmState = AUTO_DONE;
+        }
+        break;
+
+    default:
+        break;
+    }
 }
 
+// ---------------------------------------------------------------------------
+// Timing correction (TBS spec "0x3A.0x10 Timing Correction (CRSF Shot)")
+// ---------------------------------------------------------------------------
 
+void opentxSyncMessage(crsf_opentx_sync_t *TXsync)
+{
+    // Both fields are big endian and in units of 100 ns.
+    int32_t interval_us = (int32_t)htonl(TXsync->packet_inteval) / 10;
+    int32_t offset_us   = (int32_t)htonl(TXsync->phase_shift) / 10;
+
+    // The radio wants us to transmit at exactly this interval.
+    packet_rate = interval_us;
+
+    // offset > 0 means our data came too early, so we have to transmit later.
+    // The correction is applied to the transmit phase; the period stays at
+    // the requested interval. Parameter traffic perturbs the radio's phase
+    // measurement, so the controller is frozen while a scan is running.
+    if (!scanInProgress)
+    {
+        phase_integral += (int32_t)(offset_us * PHASE_KI);
+        int32_t corr = (int32_t)(offset_us * PHASE_KP) + phase_integral;
+        if (corr > PHASE_LIMIT)
+            corr = PHASE_LIMIT;
+        if (corr < -PHASE_LIMIT)
+            corr = -PHASE_LIMIT;
+        phase_correction = corr;
+    }
+
+#ifdef CRSFSHOT_DEBUG
+    Serial.print(packet_rate);
+    Serial.print('\t');
+    Serial.print(offset_us);
+    Serial.print('\t');
+    Serial.print(phase_correction);
+    Serial.print('\t');
+    Serial.println(phase_integral);
+#endif //CRSFSHOT_DEBUG
+}
 
 void setup() {
   spi2.begin();
@@ -517,10 +629,6 @@ void setup() {
   crsf.onPacketDeviceInfo = &deviceInfoMessage;
   crsf.onPacketParamEntry = &paramEntryMessage;
   crsf.onPacketParamWriteAck = &paramWriteAck;
-  Setpoint = 0;
-  syncPID.SetMode(AUTOMATIC);
-  syncPID.SetOutputLimits(-100,100);
-
 
   crsf.begin();
   crsf.onPacketVBat = &vbatMessage;
@@ -543,6 +651,9 @@ void setup() {
   motor.init();
   motor.initFOC();
 
+  // Start the transmit schedule from now
+  channelstime = (uint32_t)micros();
+
    _delay(100);
   printHelp();
   Serial.print("> ");
@@ -550,16 +661,22 @@ void setup() {
 
 void loop() {
   float angle;
-  // static uint32_t looptime = micros();
-  static uint32_t channelstime = micros();
   static crsf_channels_t channels;
   static uint32_t target = 172;
-  // uint8_t ping_msg[] = {0xee, 4, 0x28, 0x0, 0xe};
 
   crsf.loop();
   pollConsole();
   pollScan();
-  if( (micros() - channelstime) > (uint32_t)(packet_rate+packet_rate_adj) ) {
+  pollAutoTlm();
+
+  // The transmit instant is the nominal schedule plus the phase correction.
+  // The nominal schedule advances by exactly the radio's requested interval,
+  // so the correction shifts the phase without changing the rate.
+  // micros() is 32 bit and wraps every ~71 minutes, so all the time
+  // arithmetic below is done on wrapped 32 bit values.
+  uint32_t now = (uint32_t)micros();
+  uint32_t tx_at = channelstime + (uint32_t)phase_correction;
+  if ((int32_t)(now - tx_at) >= 0) {                    // now >= tx_at
     //send channels
     sensor1.update();
     angle = sensor1.getAngle();
@@ -593,9 +710,13 @@ void loop() {
     channels.ch15 = 1;
     // channels.ch16 = target;
 
-    channelstime = channelstime + ((packet_rate+packet_rate_adj));
+    channelstime += (uint32_t)packet_rate;
+    // If we fell far behind, resynchronise the schedule. The signed
+    // comparison keeps this from firing when the schedule is ahead of us.
+    if ((int32_t)(now - channelstime) > (int32_t)(packet_rate * 4))
+      channelstime = now;
+
     crsf.queuePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_RC_CHANNELS_PACKED, &channels, sizeof(channels));
-    // Serial.println(sizeof(channels));
   }
 
 }

@@ -60,6 +60,32 @@ not a request.
 The sync frame is emitted every **200 ms** (`OpenTXsyncPacketInterval`),
 which matches the 0x3A interval in every capture.
 
+### The phase controller
+
+Because `offset` is a *phase* error, the correction is applied to the transmit
+**phase** and the period is left exactly at the radio's requested interval:
+
+```cpp
+packet_rate      = interval_us;                     // exactly what the radio asked for
+phase_integral  += offset_us * PHASE_KI;             // integrate the error
+phase_correction  = offset_us * PHASE_KP + phase_integral;   // clamp to +/-PHASE_LIMIT
+```
+
+```cpp
+uint32_t tx_at = channelstime + (uint32_t)phase_correction;
+if ((int32_t)(now - tx_at) >= 0) { ... transmit ...; channelstime += packet_rate; }
+```
+
+`channelstime` advances by exactly `packet_rate`, so the packets stay
+`interval_us` apart and `phase_correction` only shifts *when* they are sent.
+The setpoint is the radio's own measurement — the published `offset` is driven
+to zero, which per ELRS means the radio's measured headroom settles at its
+100 µs safe margin.
+
+The controller is frozen while a parameter scan is running: the radio
+measures the age of our *last* frame, so the menu traffic would otherwise
+corrupt the phase measurement.
+
 ---
 
 ## Hardware
@@ -139,8 +165,22 @@ baud). The prompt is `>`, and `h` prints the help:
 > c <id> <v> set parameter <id> to <v>
 > r <id>     read parameter <id>
 > d          show link / timing status
+> a          toggle the automatic Telemetry Ratio setup
 > h          help
 ```
+
+### Automatic Telemetry Ratio setup
+
+`AUTO_SET_TLM_RATIO` in `src/main.cpp` (default `1`) makes the sketch set the
+Telemetry Ratio by itself once the CRSF link comes up:
+
+1. wait for `crsf.isLinkUp()`
+2. `0x28` broadcast ping, retry every 2 s until the radio answers
+3. walk the parameter table with `0x2C`
+4. find **"Telem Ratio"** by name, pick the fastest option, write it with `0x2D`
+
+The `a` command toggles it at runtime, and `t` performs the same step on
+demand.
 
 ### Why the parameter table is discovered at runtime
 
@@ -181,69 +221,53 @@ reorders or renames the entries.
 These are real, verified from the code and the captured traces. They are
 **not** fixed here because each needs hardware validation.
 
-1. **The phase correction is applied to the wrong quantity.** The radio
-   publishes a **measured** phase error (`offset`, +ve = data came too early),
-   so the correction belongs on the transmit **schedule**, not on the period —
-   and the setpoint should be *null the radio's own measurement*, not
-   `packet_rate / 2`. The current PID does the opposite on both counts:
-   ```cpp
-   Input = (packet_rate/2) - phase_shift;   // wrong setpoint
-   packet_rate_adj = Output;                // wrong actuator
-   ```
-   The captures agree: the TX **period was exactly 4000 µs in every single
-   trace** (i.e. `packet_rate_adj == 0`) while the reported offset varied
-   between 497 µs, 2000 µs and 2493 µs. The rate was never wrong — the phase
-   was, and nothing corrected it.
+1. **The phase controller has never been validated on hardware.** The
+   correction is now applied to the transmit phase (as the TBS spec intends)
+   and the setpoint is the radio's own measurement, but the captures are from
+   2024-11-01 and predate this change. Re-capture and confirm the published
+   `offset` converges towards zero, and tune `PHASE_KP` / `PHASE_KI` /
+   `PHASE_LIMIT` in `src/main.cpp` if it does not.
 
-2. **The loop has never been validated on hardware.** The captures are from
-   2024-11-01; the current `src/main.cpp` is from 2024-11-04. Re-capture with
-   the current firmware and confirm the phase actually converges.
-
-3. **Channel values are written in the wrong scale.** `channels.ch1 = target`
-   puts **microseconds** (1000–2000) into an 11-bit field that CRSF defines as
-   a *raw* value (172 = 988 µs … 1811 = 2012 µs). The captured traces show the
-   field correctly carrying raw values 172…1811, so the current source
+2. **Channel values are written in the wrong scale.** `channels.ch1 = target`
+   puts **microseconds** (1000-2000) into an 11-bit field that CRSF defines as
+   a *raw* value (172 = 988 us ... 1811 = 2012 us). The captured traces show
+   the field correctly carrying raw values 172...1811, so the current source
    regressed. Fix with
    `map(target, 988, 2012, CRSF_CHANNEL_VALUE_MIN, CRSF_CHANNEL_VALUE_MAX)`.
 
-4. **All 16 channels are overwritten.** `ch0` is never assigned (so it is 0 =
-   stick low) and `ch2…ch15` are set to 1 (= stick low). The radio's real
+3. **All 16 channels are overwritten.** `ch0` is never assigned (so it is 0 =
+   stick low) and `ch2...ch15` are set to 1 (= stick low). The radio's real
    stick inputs are destroyed. The fix is to parse the radio's incoming
-   `0x16` frame — note `CrsfSerial::processPacketIn` only dispatches `0x16`
-   for address `0xC8`, but the radio sends channel frames as `0xEA` — then
+   `0x16` frame - note `CrsfSerial::processPacketIn` only dispatches `0x16`
+   for address `0xC8`, but the radio sends channel frames as `0xEA` - then
    merge and override only the one channel you own.
 
-5. **The `0x08` payload is not a battery frame.** The sketch reads it as
+4. **The `0x08` payload is not a battery frame.** The sketch reads it as
    `crsf_sensor_battery_t.voltage`, but the values sit in the raw 11-bit
-   channel range (172…1811) and match the handset's own transmitted channel
+   channel range (172...1811) and match the handset's own transmitted channel
    value in 100 % of 39 403 frames. Whatever the radio is really sending in
    `0x08`, it is not a battery voltage.
 
-6. **`motor.loopFOC()` / `motor.move()` are never called.** The motor is only
+5. **`motor.loopFOC()` / `motor.move()` are never called.** The motor is only
    initialised and aligned (`initFOC()`); the sketch is an encoder *reader*.
 
-7. **`motor.sensor_offset = motor.shaft_angle;` is a no-op** — it runs before
+6. **`motor.sensor_offset = motor.shaft_angle;` is a no-op** - it runs before
    `motor.init()`, so `shaft_angle` is still 0. SimpleFOC 2.3.x uses
    `zero_electric_angle` instead.
 
-8. **The debug port is flooded.** `vbatMessage()` prints `.` for every received
+7. **The debug port is flooded.** `vbatMessage()` prints `.` for every received
    battery frame (125 Hz) onto the same 115200-baud port used for the
    angle/target trace and the menu.
 
-9. **PID tuning is misleading.** `br3ttb/PID` defaults `SampleTime` to 100 ms,
-   so `ki = Ki × 0.1 = 0.01` — the effective integral gain is 10× lower than
-   `Ki = 0.1` suggests. `Compute()` is only called from the sync callback
-   (~200 ms), so `dInput` spans 200 ms.
+8. **No catch-up clamp on the TX scheduler.** `channelstime += period`
+   accumulates nominal rather than elapsed time, so an overrun makes the
+   sketch fire frames back-to-back to catch up.
 
-10. **No catch-up clamp on the TX scheduler.** `channelstime += period`
-    accumulates nominal rather than elapsed time, so an overrun makes the
-    sketch fire frames back-to-back to catch up.
-
-11. **The handset is probably not on the radio's CRSF handset port.** ELRS
-    rewrites byte 0 to `0xC8` on that port (`CRSFHandset::forwardMessage`),
-    but the captures show `addr=EA` for received frames. The parameter
-    requests in `lib/CrsfSerial` therefore try `dest_addr = 0xEE` and fall
-    back to broadcast; confirm which connector the board is really on.
+9. **The handset is probably not on the radio's CRSF handset port.** ELRS
+   rewrites byte 0 to `0xC8` on that port (`CRSFHandset::forwardMessage`),
+   but the captures show `addr=EA` for received frames. The parameter
+   requests in `lib/CrsfSerial` therefore try `dest_addr = 0xEE` and fall
+   back to broadcast; confirm which connector the board is really on.
 
 ---
 
