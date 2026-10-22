@@ -647,9 +647,24 @@ void setup() {
   motor.voltage_limit = 12;
   motor.LPF_velocity.Tf = 0.01;
 
-  motor.sensor_offset = motor.shaft_angle;
   motor.init();
-  motor.initFOC();
+  if (!motor.initFOC())
+  {
+    // Alignment failed: the electrical zero is unknown, so the motor has to
+    // stay disabled - driving it now would use a bogus commutation angle.
+    // initFOC() has already disabled the driver.
+    Serial.println("FOC alignment FAILED - motor left disabled.");
+    Serial.println("check the supply, the driver wiring and the pole pair count");
+  }
+  else
+  {
+    // Hold the position the motor booted at: make the current angle read as
+    // zero and leave the target at zero, so the position controller keeps it
+    // there against disturbance.
+    motor.loopFOC();
+    motor.move();
+    motor.sensor_offset = motor.shaft_angle;
+  }
 
   // Start the transmit schedule from now
   channelstime = (uint32_t)micros();
@@ -663,6 +678,11 @@ void loop() {
   float angle;
   static crsf_channels_t channels;
   static uint32_t target = 172;
+
+  // FOC: commutate the motor and hold its position. This has to run every
+  // iteration - without it the motor is never commutated and never held.
+  motor.loopFOC();
+  motor.move();
 
   crsf.loop();
   pollConsole();

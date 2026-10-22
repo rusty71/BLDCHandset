@@ -216,6 +216,35 @@ latency), then writes that index with `0x2D`.
 Because the option list is read from the radio, this keeps working if ELRS
 reorders or renames the entries.
 
+## The position lock
+
+The motor runs SimpleFOC's angle mode:
+
+```
+motor.target  ->  P_angle(target - motor.shaft_angle)  ->  velocity setpoint
+               ->  PID_velocity(setpoint - motor.shaft_velocity)  ->  voltage
+               ->  loopFOC(): commutation against motor.electricalAngle()
+```
+
+Two things are needed for that to work at all:
+
+1. **`motor.loopFOC()` and `motor.move()` must run every iteration.** They
+   were missing from `loop()`, so the motor was never commutated and never
+   held - `initFOC()` aligned the sensor and then nothing drove the motor.
+   The motor, driver and PID setup in `setup()` were dead code.
+
+2. **`motor.sensor_offset = motor.shaft_angle;` has to run *after*
+   `motor.initFOC()`.** It was before `motor.init()`, where `shaft_angle` is
+   still 0, so it was a no-op. Set after alignment it makes the angle the
+   motor booted at read as zero, and with `motor.target` left at 0 the
+   position controller holds that position against disturbance.
+
+`initFOC()`'s return value is also checked now: if the alignment fails the
+electrical zero is unknown (`zero_electric_angle` stays at `-12345`), the
+commutation angle would be garbage, and SimpleFOC leaves the driver disabled.
+The sketch now reports the failure instead of silently driving the motor with
+a broken commutation.
+
 ## Known issues
 
 These are real, verified from the code and the captured traces. They are
