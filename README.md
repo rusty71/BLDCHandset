@@ -319,6 +319,51 @@ commutation angle would be garbage, and SimpleFOC leaves the driver disabled.
 The sketch now reports the failure instead of silently driving the motor with
 a broken commutation.
 
+3. **The single turn encoder's wrap is handled explicitly.** The AS5048A's
+   angle output wraps at 2π, and SimpleFOC only notices that when more than
+   0.8 of a revolution passes between two sensor updates
+   (`Sensor::update()` in `common/base_classes/Sensor.cpp`). A rotor that
+   crosses the encoder zero *slowly* is therefore not tracked at all:
+   `getAngle()` steps by a whole turn, the position error jumps by 2π and the
+   position lock stops driving the motor - or drives it the wrong way. The
+   sketch watches the raw angle itself and keeps `motor.sensor_offset` in
+   step, so the position the controller sees stays continuous. It only
+   compensates when SimpleFOC did *not* track the wrap itself, so the two
+   never double up.
+
+## Verified on hardware
+
+Measured on the real board (RP2040 Zero, AS5048A, 7 pole pair motor) with
+`variants/hardware_test.cpp`:
+
+| measurement | result |
+| ----------- | ------ |
+| AS5048A over SPI | mode 1 @ 10 MHz, live angle, 11 bit |
+| `initFOC()` | OK, `sensor_direction = 1`, `zero_elect_angle = 5.4027` |
+| FOC loop rate | ~2.5 kHz |
+| position lock, ±0.15 rad sweep | **worst error 0.0014 rad (0.08 deg)** |
+| position lock, step response | settles in well under 250 ms |
+
+The wheel is therefore position locked to within a tenth of a degree, and it
+holds position when the target is unchanged.
+
+### Running the hardware test
+
+```bash
+cp variants/hardware_test.cpp src/main.cpp
+pio run -t upload --upload-port /dev/serial/by-id/usb-Arduino_RaspberryPi_Pico_XXXXXXXX-if00
+# then type any character on the serial port to start
+git checkout src/main.cpp
+```
+
+The other sketches in `variants/` are bench diagnostics:
+`diagnostic.cpp` (registers + motor drive), `spi_probe.cpp` (bit banged SPI
+register dump), `spi_mode_test.cpp` (SPI mode comparison) and `foc_chain.cpp`
+(the control chain internals).
+
+> Use the `/dev/serial/by-id/...` path, never `/dev/ttyACM0` - the numbering
+> changes when two boards are plugged in.
+
 ## Known issues
 
 These are real, verified from the code and the captured traces. They are
