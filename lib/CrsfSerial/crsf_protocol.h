@@ -44,7 +44,9 @@ typedef enum
     CRSF_FRAMETYPE_BATTERY_SENSOR = 0x08,
     CRSF_FRAMETYPE_LINK_STATISTICS = 0x14,
     CRSF_FRAMETYPE_OPENTX_SYNC = 0x10,
-    CRSF_FRAMETYPE_RADIO_ID = 0x3A,
+    // 0x3A is the HANDSET frame in ELRS 3.x/4.x (it used to be RADIO_ID in the
+    // original CRSF spec). Sub-command 0x10 carries the timing correction.
+    CRSF_FRAMETYPE_HANDSET = 0x3A,
     CRSF_FRAMETYPE_RC_CHANNELS_PACKED = 0x16,
     CRSF_FRAMETYPE_ATTITUDE = 0x1E,
     CRSF_FRAMETYPE_FLIGHT_MODE = 0x21,
@@ -54,6 +56,7 @@ typedef enum
     CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY = 0x2B,
     CRSF_FRAMETYPE_PARAMETER_READ = 0x2C,
     CRSF_FRAMETYPE_PARAMETER_WRITE = 0x2D,
+    CRSF_FRAMETYPE_ELRS_STATUS = 0x2E,
     CRSF_FRAMETYPE_COMMAND = 0x32,
     // MSP commands
     CRSF_FRAMETYPE_MSP_REQ = 0x7A,   // response request using msp sequence as command
@@ -141,12 +144,79 @@ typedef struct crsf_sensor_gps_s
 
 typedef struct crsf_opentx_sync_s
 {
-    uint8_t ext_device_addr_src;
-    uint8_t ext_device_addr_dst;
-    uint8_t ext_type;
-    int32_t packet_inteval;
-    int32_t phase_shift;
+    uint8_t ext_device_addr_src;   // destination address (0xEA)
+    uint8_t ext_device_addr_dst;   // origin address      (0xEE)
+    uint8_t ext_type;              // sub command          (CRSF_HANDSET_SUBCMD_TIMING)
+    int32_t packet_inteval;        // update_interval, LSB = 100ns
+    int32_t phase_shift;           // offset, LSB = 100ns, +ve = data came too early
 } PACKED crsf_opentx_sync_t;
+
+// Sub-command of CRSF_FRAMETYPE_HANDSET (0x3A)
+#define CRSF_HANDSET_SUBCMD_TIMING  0x10
+
+// ---------------------------------------------------------------------------
+// Extended header frames
+//   [sync/device_addr][frame_size][type][dest_addr][orig_addr][payload][crc]
+// frame_size counts type + dest + orig + payload + crc
+// ---------------------------------------------------------------------------
+#define CRSF_ADDRESS_CRSF_TRANSMITTER 0xEE
+#define CRSF_ADDRESS_RADIO_TRANSMITTER 0xEA
+
+typedef struct crsf_ext_header_s
+{
+    uint8_t device_addr;   // 0xC8 on a serial link
+    uint8_t frame_size;    // type + dest + orig + payload + crc
+    uint8_t type;
+    uint8_t dest_addr;
+    uint8_t orig_addr;
+    uint8_t data[0];
+} PACKED crsf_ext_header_t;
+
+// ---------------------------------------------------------------------------
+// Parameter / menu protocol (TBS CRSF spec 0x28 .. 0x2D)
+// ---------------------------------------------------------------------------
+
+// 0x29 Parameter Device Information (after the null terminated device name)
+typedef struct crsf_device_info_s
+{
+    uint32_t serial_number;        // big endian
+    uint32_t hardware_id;          // big endian
+    uint32_t firmware_id;          // big endian
+    uint8_t  parameters_total;     // number of parameters the device exposes
+    uint8_t  parameter_version;
+} PACKED crsf_device_info_t;
+
+// 0x2B Parameter Settings (Entry) chunk header
+typedef struct crsf_param_chunk_s
+{
+    uint8_t parameter_number;
+    uint8_t chunks_remaining;      // chunks left after this one
+    uint8_t data[0];               // type specific payload
+} PACKED crsf_param_chunk_t;
+
+// Parameter data types, bit 7 marks the entry as hidden
+enum crsf_param_type_e
+{
+    CRSF_PARAM_UINT8         = 0,
+    CRSF_PARAM_INT8          = 1,
+    CRSF_PARAM_UINT16        = 2,
+    CRSF_PARAM_INT16         = 3,
+    CRSF_PARAM_UINT32        = 4,
+    CRSF_PARAM_INT32         = 5,
+    CRSF_PARAM_FLOAT         = 8,
+    CRSF_PARAM_TEXT_SELECTION = 9,
+    CRSF_PARAM_STRING        = 10,
+    CRSF_PARAM_FOLDER        = 11,
+    CRSF_PARAM_INFO          = 12,
+    CRSF_PARAM_COMMAND       = 13,
+    CRSF_PARAM_OUT_OF_RANGE  = 127
+};
+#define CRSF_PARAM_TYPE_MASK    0x7F
+#define CRSF_PARAM_TYPE_HIDDEN  0x80
+
+// Maximum sizes used when decoding a parameter entry
+#define CRSF_PARAM_NAME_MAX     32
+#define CRSF_PARAM_OPTIONS_MAX  64
 
 #if !defined(__linux__)
 static inline uint16_t htobe16(uint16_t val)

@@ -6,6 +6,21 @@
 
 enum eFailsafeAction { fsaNoPulses, fsaHold };
 
+// A decoded parameter entry as described by the TBS CRSF spec 0x2B
+struct crsf_param_t
+{
+    uint8_t id;                              // parameter number
+    uint8_t parent;                          // parent folder number
+    uint8_t type;                            // crsf_param_type_e, hidden bit stripped
+    bool    hidden;                          // entry is hidden from the host UI
+    char    name[CRSF_PARAM_NAME_MAX];
+    char    options[CRSF_PARAM_OPTIONS_MAX]; // semicolon separated, TEXT_SELECTION only
+    uint8_t value;                           // TEXT_SELECTION: index into options
+    uint8_t min;
+    uint8_t max;
+    uint8_t def;
+};
+
 class CrsfSerial
 {
 public:
@@ -19,6 +34,18 @@ public:
     void write(uint8_t b);
     void write(const uint8_t *buf, size_t len);
     void queuePacket(uint8_t addr, uint8_t type, const void *payload, uint8_t len);
+    // Extended header frame: [addr][len][type][dest][orig][payload][crc]
+    void queuePacketExt(uint8_t addr, uint8_t dest, uint8_t orig, uint8_t type,
+                        const void *payload, uint8_t len);
+
+    // --- Parameter / menu protocol -----------------------------------------
+    // Ask a device (0x00 = broadcast) to announce its parameter table (0x28)
+    void sendDevicePing(uint8_t dest_addr);
+    // Read parameter <id>, chunk <chunk> (0x2C)
+    void sendParamRead(uint8_t id, uint8_t chunk = 0);
+    // Write parameter <id> (0x2D). len depends on the parameter type.
+    void sendParamWrite(uint8_t id, const void *value, uint8_t len);
+    void sendParamWriteU8(uint8_t id, uint8_t value);
 
     uint32_t getBaud() const { return _baud; };
     // Return current channel value (1-based) in us
@@ -40,6 +67,12 @@ public:
     void (*onPacketGps)(crsf_sensor_gps_t *gpsSensor);
     void (*onPacketVBat)(crsf_sensor_battery_t *vbatSensor);
     void (*onPacketSync)(crsf_opentx_sync_t *syncReq);
+    // 0x29 Parameter Device Information
+    void (*onPacketDeviceInfo)(crsf_device_info_t *info);
+    // 0x2B Parameter Settings (Entry), fully reassembled and decoded
+    void (*onPacketParamEntry)(crsf_param_t *param);
+    // 0x2D Parameter write acknowledgement
+    void (*onPacketParamWriteAck)(uint8_t id, const uint8_t *value, uint8_t len);
 
 private:
     HardwareSerial &_port;
@@ -50,6 +83,7 @@ private:
     crsf_opentx_sync_t _opentxSync;
     crsf_sensor_gps_t _gpsSensor;
     crsf_sensor_battery_t  vbatSensor;
+    crsf_device_info_t _deviceInfo;
     uint32_t _baud;
     uint32_t _lastReceive;
     uint32_t _pktStart;
@@ -57,6 +91,12 @@ private:
     bool _linkIsUp;
     uint32_t _passthroughBaud;
     int _channels[CRSF_NUM_CHANNELS];
+
+    // Parameter entry reassembly
+    uint8_t _paramBuf[CRSF_MAX_PACKET_SIZE * 2];
+    uint8_t _paramBufLen;
+    uint8_t _paramId;
+    uint8_t _paramChunksLeft;
 
     void handleSerialIn();
     void handleByteReceived();
@@ -70,4 +110,7 @@ private:
     void packetLinkStatistics(const crsf_header_t *p);
     void packetOpenTXSync(const crsf_opentx_sync_t *p);
     void packetGps(const crsf_header_t *p);
+    void packetDeviceInfo(const crsf_ext_header_t *p);
+    void packetParamEntry(const crsf_ext_header_t *p);
+    void packetParamWriteAck(const crsf_ext_header_t *p);
 };

@@ -1,5 +1,7 @@
 #include "CrsfSerial.h"
 
+#include <string.h>
+
 #undef CRSF_PERFORMANCE_CSV
 // static void hexdump(void *p, size_t len)
 // {
@@ -34,8 +36,10 @@
 CrsfSerial::CrsfSerial(HardwareSerial &port, uint32_t baud) :
     _port(port), _crc(0xd5), _baud(baud),
     _lastReceive(0), _lastChannelsPacket(0), _linkIsUp(false),
-    _passthroughBaud(0)
-{}
+    _passthroughBaud(0), _paramBufLen(0), _paramId(0), _paramChunksLeft(0)
+{
+    memset(&_deviceInfo, 0, sizeof(_deviceInfo));
+}
 
 void CrsfSerial::begin(uint32_t baud)
 {
@@ -195,15 +199,36 @@ void CrsfSerial::processPacketIn(uint8_t len)
             break;
         }
     } // CRSF_ADDRESS_FLIGHT_CONTROLLER
-    if (hdr->device_addr == 0xEA)
+
+    // The HANDSET (timing correction) frame is matched on type only: the
+    // radio may put its device address or the 0xC8 serial sync byte in the
+    // first slot depending on which connector it is delivered through.
+    if (hdr->type == CRSF_FRAMETYPE_HANDSET)
     {
+        packetOpenTXSync(opentx_sync);
+    }
+
+// Parameter protocol frames are extended header frames. The device may
+    // answer with either its device address or the 0xC8 serial sync byte in
+    // the first slot, so match on the frame type only.
+    if (hdr->type == CRSF_FRAMETYPE_DEVICE_INFO ||
+        hdr->type == CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY ||
+        hdr->type == CRSF_FRAMETYPE_PARAMETER_WRITE)
+    {
+        const crsf_ext_header_t *ext = (const crsf_ext_header_t *)_rxBuf;
         switch (hdr->type)
         {
-        case CRSF_FRAMETYPE_RADIO_ID:
-            packetOpenTXSync(opentx_sync);
+        case CRSF_FRAMETYPE_DEVICE_INFO:
+            packetDeviceInfo(ext);
+            break;
+        case CRSF_FRAMETYPE_PARAMETER_SETTINGS_ENTRY:
+            packetParamEntry(ext);
+            break;
+        case CRSF_FRAMETYPE_PARAMETER_WRITE:
+            packetParamWriteAck(ext);
             break;
         }
-    } // CRSF_ADDRESS_FLIGHT_CONTROLLER
+    }
 }
 
 // Shift the bytes in the RxBuf down by cnt bytes
@@ -267,6 +292,134 @@ void CrsfSerial::packetOpenTXSync(const crsf_opentx_sync_t *p)
 
     if (onPacketSync)
         onPacketSync(&_opentxSync);
+}
+
+// ---------------------------------------------------------------------------
+// Parameter / menu protocol handlers
+// ---------------------------------------------------------------------------
+
+// Decode a fully reassembled 0x2B parameter entry and hand it to the user.
+static void decodeParamEntry(uint8_t id, const uint8_t *buf, uint8_t len, crsf_param_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->id = id;
+
+    // A well formed entry needs at least parent + type + a one char name
+    if (len < 4)
+        return;
+
+    out->parent = buf[0];
+    out->type = buf[1] & CRSF_PARAM_TYPE_MASK;
+    out->hidden = (buf[1] & CRSF_PARAM_TYPE_HIDDEN) != 0;
+
+    const uint8_t *p = &buf[2];
+    uint8_t avail = len - 2;
+
+    // Name, null terminated
+    uint8_t nameLen = 0;
+    while (nameLen < avail && p[nameLen] != 0)
+        nameLen++;
+    uint8_t nameCopy = nameLen < (CRSF_PARAM_NAME_MAX - 1) ? nameLen : (CRSF_PARAM_NAME_MAX - 1);
+    memcpy(out->name, p, nameCopy);
+    out->name[nameCopy] = 0;
+    p += nameLen + 1;
+    avail = (p > &buf[len]) ? 0 : (uint8_t)(&buf[len] - p);
+
+    if (out->type == CRSF_PARAM_TEXT_SELECTION)
+    {
+        // Options, null terminated semicolon separated list
+        uint8_t optLen = 0;
+        while (optLen < avail && p[optLen] != 0)
+            optLen++;
+        uint8_t optCopy = optLen < (CRSF_PARAM_OPTIONS_MAX - 1) ? optLen : (CRSF_PARAM_OPTIONS_MAX - 1);
+        memcpy(out->options, p, optCopy);
+        out->options[optCopy] = 0;
+        p += optLen + 1;
+        avail = (p > &buf[len]) ? 0 : (uint8_t)(&buf[len] - p);
+
+        // value, min, max, default
+        if (avail >= 4)
+        {
+            out->value = p[0];
+            out->min = p[1];
+            out->max = p[2];
+            out->def = p[3];
+        }
+    }
+}
+
+void CrsfSerial::packetDeviceInfo(const crsf_ext_header_t *p)
+{
+    // frame_size counts type + dest + orig + payload + crc
+    if (p->frame_size < 4)
+        return;
+    uint8_t payloadLen = p->frame_size - 4;
+    if (payloadLen < sizeof(crsf_device_info_t) + 1)
+        return;
+
+    // The payload starts with the null terminated device name
+    const char *name = (const char *)p->data;
+    uint8_t nameLen = 0;
+    while (nameLen < payloadLen && name[nameLen] != 0)
+        nameLen++;
+    uint8_t infoLen = sizeof(crsf_device_info_t);
+    if (nameLen + 1 + infoLen > payloadLen)
+        return;
+
+    memcpy(&_deviceInfo, &p->data[nameLen + 1], infoLen);
+    _deviceInfo.serial_number = be32toh(_deviceInfo.serial_number);
+    _deviceInfo.hardware_id = be32toh(_deviceInfo.hardware_id);
+    _deviceInfo.firmware_id = be32toh(_deviceInfo.firmware_id);
+
+    if (onPacketDeviceInfo)
+        onPacketDeviceInfo(&_deviceInfo);
+}
+
+void CrsfSerial::packetParamEntry(const crsf_ext_header_t *p)
+{
+    if (p->frame_size < 6)
+        return;
+    uint8_t payloadLen = p->frame_size - 4;
+    if (payloadLen < 2)
+        return;
+
+    uint8_t id = p->data[0];
+    uint8_t remaining = p->data[1];
+    uint8_t chunkLen = payloadLen - 2;
+    const uint8_t *chunk = &p->data[2];
+
+    // Reassemble chunks of a single parameter entry
+    if (id != _paramId)
+    {
+        _paramId = id;
+        _paramBufLen = 0;
+    }
+    uint8_t space = (uint8_t)(sizeof(_paramBuf) - _paramBufLen);
+    if (chunkLen > space)
+        chunkLen = space;
+    memcpy(&_paramBuf[_paramBufLen], chunk, chunkLen);
+    _paramBufLen = (uint8_t)(_paramBufLen + chunkLen);
+
+    if (remaining == 0)
+    {
+        crsf_param_t param;
+        decodeParamEntry(id, _paramBuf, _paramBufLen, &param);
+        _paramBufLen = 0;
+        if (onPacketParamEntry)
+            onPacketParamEntry(&param);
+    }
+}
+
+void CrsfSerial::packetParamWriteAck(const crsf_ext_header_t *p)
+{
+    if (p->frame_size < 5)
+        return;
+    uint8_t payloadLen = p->frame_size - 4;
+    if (payloadLen < 1)
+        return;
+
+    if (onPacketParamWriteAck)
+        onPacketParamWriteAck(p->data[0], &p->data[1], payloadLen - 1);
 }
 
 void CrsfSerial::packetLinkStatistics(const crsf_header_t *p)
@@ -371,6 +524,63 @@ void CrsfSerial::queuePacket(uint8_t addr, uint8_t type, const void *payload, ui
     buf[len+3] = _crc.calc(&buf[2], len + 1);
 
     write(buf, len + 4);
+}
+
+// Extended header frame: [addr][len][type][dest][orig][payload][crc]
+void CrsfSerial::queuePacketExt(uint8_t addr, uint8_t dest, uint8_t orig, uint8_t type,
+                                const void *payload, uint8_t len)
+{
+    if (getPassthroughMode())
+        return;
+    if (len > CRSF_MAX_PAYLOAD_LEN)
+        return;
+
+    uint8_t buf[CRSF_MAX_PACKET_SIZE];
+    buf[0] = addr;
+    buf[1] = len + 4; // type + dest + orig + payload + crc
+    buf[2] = type;
+    buf[3] = dest;
+    buf[4] = orig;
+    memcpy(&buf[5], payload, len);
+    buf[len+5] = _crc.calc(&buf[2], len + 3);
+
+    write(buf, len + 6);
+}
+
+// ---------------------------------------------------------------------------
+// Parameter / menu protocol
+// ---------------------------------------------------------------------------
+
+void CrsfSerial::sendDevicePing(uint8_t dest_addr)
+{
+    // 0x28 has no payload. The origin address identifies us as the remote
+    // control (0xEA) which is what ELRS expects on its handset port.
+    queuePacketExt(CRSF_SYNC_BYTE, dest_addr, CRSF_ADDRESS_RADIO_TRANSMITTER,
+                   CRSF_FRAMETYPE_DEVICE_PING, NULL, 0);
+}
+
+void CrsfSerial::sendParamRead(uint8_t id, uint8_t chunk)
+{
+    uint8_t payload[2] = { id, chunk };
+    queuePacketExt(CRSF_SYNC_BYTE, CRSF_ADDRESS_CRSF_TRANSMITTER, CRSF_ADDRESS_RADIO_TRANSMITTER,
+                   CRSF_FRAMETYPE_PARAMETER_READ, payload, sizeof(payload));
+}
+
+void CrsfSerial::sendParamWrite(uint8_t id, const void *value, uint8_t len)
+{
+    if (len + 1 > CRSF_MAX_PAYLOAD_LEN)
+        return;
+    uint8_t payload[CRSF_MAX_PAYLOAD_LEN];
+    payload[0] = id;
+    if (len)
+        memcpy(&payload[1], value, len);
+    queuePacketExt(CRSF_SYNC_BYTE, CRSF_ADDRESS_CRSF_TRANSMITTER, CRSF_ADDRESS_RADIO_TRANSMITTER,
+                   CRSF_FRAMETYPE_PARAMETER_WRITE, payload, len + 1);
+}
+
+void CrsfSerial::sendParamWriteU8(uint8_t id, uint8_t value)
+{
+    sendParamWrite(id, &value, 1);
 }
 
 /**

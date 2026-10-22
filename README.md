@@ -18,7 +18,9 @@ local fork of the CRSF protocol library.
       │  addr 0xEA                                  │  addr 0xC8
       │  0x08 battery      @  8 ms                  │  0x16 RC channels @ 4 ms
       │  0x14 link stats   @ 240 ms                 │  (injects the encoder angle
-      │  0x3A radio id     @ 200 ms  ── sync ──►   │   as a stick axis)
+      │  0x3A HANDSET      @ 200 ms  ── timing ──►  │   as a stick axis)
+      │       0x10 TIMING  (rate + phase offset)    │
+      │  ← 0x28/0x29/0x2B/0x2C/0x2D parameter menu ─┘
       └─────────────────────────────────────────────┴──────► ELRS receiver
 ```
 
@@ -26,30 +28,37 @@ The handset impersonates the **flight controller** (`0xC8`) so the radio's CRSF
 output to the ELRS receiver carries the injected axis, and it consumes the
 radio's own frames (`0xEA`) for telemetry and timing.
 
+In ELRS terms this device is a **handset**: `TXModuleEndpoint::handleRaw()`
+intercepts the `0x16` frame on the CRSF bus and hands it to the radio as the
+RC channel data, which the radio then sends over the RF link.
+
 ### The ELRS / CRSF phase lock
 
-The radio publishes its uplink period and a phase request inside the `0x3A`
-radio-ID frame (`crsf_opentx_sync_t`, both fields in units of 0.1 µs):
-
-| field           | typical value | meaning                       |
-| --------------- | ------------- | ----------------------------- |
-| `packet_inteval` | 40000       | uplink period = 4000 µs       |
-| `phase_shift`    | ~20000      | requested phase = 2000 µs     |
-
-The handset servos its **own transmit period** so that its frames land in the
-middle of the radio's uplink slots:
+The radio publishes its uplink period and a **timing correction** inside the
+`0x3A` frame. In ELRS 3.x/4.x this frame is `CRSF_FRAMETYPE_HANDSET` with
+sub-command `0x10` (`CRSF_HANDSET_SUBCMD_TIMING`) — the TBS spec calls it
+*"0x3A.0x10 Timing Correction (CRSF Shot)"*, aka "RC-sync":
 
 ```cpp
-packet_rate = htonl(TXsync->packet_inteval) / 10;   // 40000 -> 4000 µs
-phase_shift = htonl(TXsync->phase_shift) / 10;       // raw 0.1 µs
-Input = (packet_rate / 2) - phase_shift;             // error vs. half period
-syncPID.Compute();                                   // P-on-measurement PID
-packet_rate_adj = Output;                            // +/- 100 µs
-// effective TX period = packet_rate + packet_rate_adj
+uint32_t update_interval;   // LSB = 100ns
+int32_t  offset;            // LSB = 100ns, +ve = data came too early, -ve = late
 ```
 
-Targeting `phase_shift == packet_rate / 2` places the handset's frames exactly
-half an uplink period away from the radio's — the maximum possible clearance.
+ELRS builds it in `src/lib/Handset/CRSFHandset.cpp::sendSyncPacketToTX()`:
+
+| field          | ELRS source                            | value in the captures |
+| -------------- | -------------------------------------- | --------------------- |
+| `update_interval` | `RequestedRCpacketInterval * 10`    | 40000 → **4000 µs**   |
+| `offset`       | `OpenTXsyncOffset - 100 µs`             | 20002 → **2000 µs**   |
+
+`OpenTXsyncOffset` is a 5-sample moving average of the time from the
+handset's last CRSF packet to the radio's next RF transmission, measured in
+`CRSFHandset::JustSentRFpacket()` (called from the OTA timer callback). The
+radio therefore publishes **a measured phase error of the handset's frames**,
+not a request.
+
+The sync frame is emitted every **200 ms** (`OpenTXsyncPacketInterval`),
+which matches the 0x3A interval in every capture.
 
 ---
 
@@ -87,7 +96,7 @@ port to a specific board (the file ships with them commented out).
 ## Repository layout
 
 ```
-src/main.cpp                    active sketch
+src/main.cpp                    active sketch (SimpleFOC + CRSF phase lock + menu)
 variants/                       version snapshots of earlier sketches
 lib/CrsfSerial/                 CRSF protocol library (local fork)
 lib/crc8/                       CRC-8 (poly 0xD5) used by CRSF
@@ -95,6 +104,10 @@ serplot.py                      captures the debug serial stream to test.csv
 elrs.ipynb                      CRSF timing analysis notebook
 test_crsfshot*.csv              captured CRSF timing traces (see below)
 ```
+
+The menu and the ELRS parameter protocol live in `src/main.cpp` and
+`lib/CrsfSerial/` respectively — the sketch talks to the radio's parameter
+table over the same CRSF port it uses for the channel frames.
 
 ### Captured traces
 
@@ -114,52 +127,123 @@ Measured transmit quality across all traces: **4000 µs period, jitter σ ≈ 3�
 
 ---
 
+## Menu
+
+There is no display, so the menu lives on the **debug serial port** (115 200
+baud). The prompt is `>`, and `h` prints the help:
+
+```
+> s          scan the ELRS parameter table (0x28 ping -> 0x29 -> 0x2C per id)
+> l          list the discovered parameters
+> t          set Telemetry Ratio to the fastest option
+> c <id> <v> set parameter <id> to <v>
+> r <id>     read parameter <id>
+> d          show link / timing status
+> h          help
+```
+
+### Why the parameter table is discovered at runtime
+
+The radio exposes its settings over the standard CRSF parameter protocol
+(TBS spec `0x28`–`0x2D`):
+
+| frame | direction | purpose |
+| ----- | --------- | ------- |
+| `0x28` Parameter Ping | → radio | ask the device to announce its parameter table |
+| `0x29` Parameter Device Information | ← radio | device name, serial/hardware/firmware id, **parameter count** |
+| `0x2B` Parameter Settings (Entry) | ← radio | one parameter definition, chunked |
+| `0x2C` Parameter Settings (Read) | → radio | read parameter `<id>`, chunk `<n>` |
+| `0x2D` Parameter Value (Write) | → radio | write parameter `<id>`; the radio confirms with a `0x2D` |
+
+ELRS assigns parameter ids in registration order (`registerLUAParameter()` →
+`lastLuaField++`), so **the id of "Telem Ratio" changes between ELRS
+releases**. The sketch therefore never hard-codes an id: it pings the radio,
+reads the parameter count from `0x29`, walks ids `1..N` with `0x2C`, and
+matches the entry by **name**.
+
+`Telem Ratio` is a `TEXT_SELECTION` parameter, so its `0x2B` entry carries the
+full option list:
+
+```
+Std;Off;1:128;1:64;1:32;1:16;1:8;1:4;1:2;Race
+```
+
+The value is an **index** into that list, and ELRS maps it straight onto
+`expresslrs_tlm_ratio_e`. `t` parses the option list and picks the entry with
+the smallest denominator (i.e. `1:2`, the fastest downlink → lowest round-trip
+latency), then writes that index with `0x2D`.
+
+Because the option list is read from the radio, this keeps working if ELRS
+reorders or renames the entries.
+
 ## Known issues
 
 These are real, verified from the code and the captured traces. They are
 **not** fixed here because each needs hardware validation.
 
-1. **The PID never influenced the transmit period in any capture.** The TX
-   period is exactly 4000 µs in *all four* traces, i.e. `packet_rate_adj == 0`,
-   even in the trace where the radio reported a 1502 µs phase error. The
-   captured firmware predates the current `src/main.cpp` (captures: 2024-11-01,
-   source: 2024-11-04), so the sync loop has **not yet been validated on
-   hardware**. Re-capture with the current firmware and confirm
-   `packet_rate_adj` becomes non-zero.
+1. **The phase correction is applied to the wrong quantity.** The radio
+   publishes a **measured** phase error (`offset`, +ve = data came too early),
+   so the correction belongs on the transmit **schedule**, not on the period —
+   and the setpoint should be *null the radio's own measurement*, not
+   `packet_rate / 2`. The current PID does the opposite on both counts:
+   ```cpp
+   Input = (packet_rate/2) - phase_shift;   // wrong setpoint
+   packet_rate_adj = Output;                // wrong actuator
+   ```
+   The captures agree: the TX **period was exactly 4000 µs in every single
+   trace** (i.e. `packet_rate_adj == 0`) while the reported offset varied
+   between 497 µs, 2000 µs and 2493 µs. The rate was never wrong — the phase
+   was, and nothing corrected it.
 
-2. **Channel values are written in the wrong scale.** `channels.ch1 = target`
+2. **The loop has never been validated on hardware.** The captures are from
+   2024-11-01; the current `src/main.cpp` is from 2024-11-04. Re-capture with
+   the current firmware and confirm the phase actually converges.
+
+3. **Channel values are written in the wrong scale.** `channels.ch1 = target`
    puts **microseconds** (1000–2000) into an 11-bit field that CRSF defines as
    a *raw* value (172 = 988 µs … 1811 = 2012 µs). The captured traces show the
    field correctly carrying raw values 172…1811, so the current source
    regressed. Fix with
    `map(target, 988, 2012, CRSF_CHANNEL_VALUE_MIN, CRSF_CHANNEL_VALUE_MAX)`.
 
-3. **All 16 channels are overwritten.** `ch0` is never assigned (so it is 0 =
+4. **All 16 channels are overwritten.** `ch0` is never assigned (so it is 0 =
    stick low) and `ch2…ch15` are set to 1 (= stick low). The radio's real
    stick inputs are destroyed. The fix is to parse the radio's incoming
    `0x16` frame — note `CrsfSerial::processPacketIn` only dispatches `0x16`
    for address `0xC8`, but the radio sends channel frames as `0xEA` — then
    merge and override only the one channel you own.
 
-4. **`motor.loopFOC()` / `motor.move()` are never called.** The motor is only
+5. **The `0x08` payload is not a battery frame.** The sketch reads it as
+   `crsf_sensor_battery_t.voltage`, but the values sit in the raw 11-bit
+   channel range (172…1811) and match the handset's own transmitted channel
+   value in 100 % of 39 403 frames. Whatever the radio is really sending in
+   `0x08`, it is not a battery voltage.
+
+6. **`motor.loopFOC()` / `motor.move()` are never called.** The motor is only
    initialised and aligned (`initFOC()`); the sketch is an encoder *reader*.
 
-5. **`motor.sensor_offset = motor.shaft_angle;` is a no-op** — it runs before
+7. **`motor.sensor_offset = motor.shaft_angle;` is a no-op** — it runs before
    `motor.init()`, so `shaft_angle` is still 0. SimpleFOC 2.3.x uses
    `zero_electric_angle` instead.
 
-6. **The debug port is flooded.** `vbatMessage()` prints `.` for every received
+8. **The debug port is flooded.** `vbatMessage()` prints `.` for every received
    battery frame (125 Hz) onto the same 115200-baud port used for the
-   angle/target trace.
+   angle/target trace and the menu.
 
-7. **PID tuning is misleading.** `br3ttb/PID` defaults `SampleTime` to 100 ms,
+9. **PID tuning is misleading.** `br3ttb/PID` defaults `SampleTime` to 100 ms,
    so `ki = Ki × 0.1 = 0.01` — the effective integral gain is 10× lower than
    `Ki = 0.1` suggests. `Compute()` is only called from the sync callback
    (~200 ms), so `dInput` spans 200 ms.
 
-8. **No catch-up clamp on the TX scheduler.** `channelstime += period`
-   accumulates nominal rather than elapsed time, so an overrun makes the
-   sketch fire frames back-to-back to catch up.
+10. **No catch-up clamp on the TX scheduler.** `channelstime += period`
+    accumulates nominal rather than elapsed time, so an overrun makes the
+    sketch fire frames back-to-back to catch up.
+
+11. **The handset is probably not on the radio's CRSF handset port.** ELRS
+    rewrites byte 0 to `0xC8` on that port (`CRSFHandset::forwardMessage`),
+    but the captures show `addr=EA` for received frames. The parameter
+    requests in `lib/CrsfSerial` therefore try `dest_addr = 0xEE` and fall
+    back to broadcast; confirm which connector the board is really on.
 
 ---
 
