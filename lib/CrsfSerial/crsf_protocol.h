@@ -216,7 +216,7 @@ enum crsf_param_type_e
 
 // Maximum sizes used when decoding a parameter entry
 #define CRSF_PARAM_NAME_MAX     32
-#define CRSF_PARAM_OPTIONS_MAX  64
+#define CRSF_PARAM_OPTIONS_MAX  160
 
 #if !defined(__linux__)
 static inline uint16_t htobe16(uint16_t val)

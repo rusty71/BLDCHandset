@@ -64,6 +64,7 @@ void CrsfSerial::handleSerialIn()
 
         if(_rxBufPos == 0)
             _pktStart = micros();
+        _bytesReceived++;
         if (getPassthroughMode())
         {
             if (onOobData)
@@ -153,7 +154,10 @@ void CrsfSerial::checkLinkDown()
 
 void CrsfSerial::processPacketIn(uint8_t len)
 {
+    _framesReceived++;
     const crsf_header_t *hdr = (crsf_header_t *)_rxBuf;
+    if (onPacketAny)
+        onPacketAny(hdr->device_addr, (uint8_t)_rxBuf[2], len, _rxBuf);
     const crsf_opentx_sync_t *opentx_sync = (crsf_opentx_sync_t *)(_rxBuf+3);
 
 #ifdef CRSF_PERFORMANCE_CSV
@@ -202,7 +206,11 @@ void CrsfSerial::processPacketIn(uint8_t len)
 
     // The radio forwards the ELRS receiver's telemetry (the servo reports its
     // position in the battery sensor frame) on the radio's own address.
-    if (hdr->device_addr == CRSF_ADDRESS_RADIO_TRANSMITTER)
+    // Battery frames are relayed by the radio with the radio's address, but
+    // accept the flight controller address as well so a servo wired straight
+    // to this board can be tested without the radio in between.
+    if (hdr->device_addr == CRSF_ADDRESS_RADIO_TRANSMITTER ||
+        hdr->device_addr == CRSF_ADDRESS_FLIGHT_CONTROLLER)
     {
         switch (hdr->type)
         {
@@ -268,21 +276,37 @@ void CrsfSerial::shiftRxBuffer(uint8_t cnt)
 void CrsfSerial::packetChannelsPacked(const crsf_header_t *p)
 {
     crsf_channels_t *ch = (crsf_channels_t *)&p->data;
+    _channels_raw[0] = ch->ch0;
     _channels[0] = ch->ch0;
+    _channels_raw[1] = ch->ch1;
     _channels[1] = ch->ch1;
+    _channels_raw[2] = ch->ch2;
     _channels[2] = ch->ch2;
+    _channels_raw[3] = ch->ch3;
     _channels[3] = ch->ch3;
+    _channels_raw[4] = ch->ch4;
     _channels[4] = ch->ch4;
+    _channels_raw[5] = ch->ch5;
     _channels[5] = ch->ch5;
+    _channels_raw[6] = ch->ch6;
     _channels[6] = ch->ch6;
+    _channels_raw[7] = ch->ch7;
     _channels[7] = ch->ch7;
+    _channels_raw[8] = ch->ch8;
     _channels[8] = ch->ch8;
+    _channels_raw[9] = ch->ch9;
     _channels[9] = ch->ch9;
+    _channels_raw[10] = ch->ch10;
     _channels[10] = ch->ch10;
+    _channels_raw[11] = ch->ch11;
     _channels[11] = ch->ch11;
+    _channels_raw[12] = ch->ch12;
     _channels[12] = ch->ch12;
+    _channels_raw[13] = ch->ch13;
     _channels[13] = ch->ch13;
+    _channels_raw[14] = ch->ch14;
     _channels[14] = ch->ch14;
+    _channels_raw[15] = ch->ch15;
     _channels[15] = ch->ch15;
 
     for (unsigned int i=0; i<CRSF_NUM_CHANNELS; ++i)
@@ -405,10 +429,11 @@ void CrsfSerial::packetParamEntry(const crsf_ext_header_t *p)
     {
         _paramId = id;
         _paramBufLen = 0;
+        _paramChunk = 0;
     }
-    uint8_t space = (uint8_t)(sizeof(_paramBuf) - _paramBufLen);
+    uint16_t space = (uint16_t)(sizeof(_paramBuf) - _paramBufLen);
     if (chunkLen > space)
-        chunkLen = space;
+        chunkLen = (uint8_t)space;
     memcpy(&_paramBuf[_paramBufLen], chunk, chunkLen);
     _paramBufLen = (uint8_t)(_paramBufLen + chunkLen);
 
@@ -419,6 +444,16 @@ void CrsfSerial::packetParamEntry(const crsf_ext_header_t *p)
         _paramBufLen = 0;
         if (onPacketParamEntry)
             onPacketParamEntry(&param);
+    }
+    else
+    {
+        // Entries longer than one frame arrive in chunks. The second byte of
+        // a read request is the *chunk index*, not a byte offset (the module
+        // slices the entry into fixed size chunks), so just ask for the next
+        // one. Without this, long entries (Packet Rate, Telem Ratio, ...) are
+        // never completed and silently disappear from the table.
+        _paramChunk++;
+        sendParamRead(id, _paramChunk);
     }
 }
 

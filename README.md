@@ -202,6 +202,9 @@ baud). The prompt is `>`, and `h` prints the help:
 > g          show the servo follow gain
 > g <gain>   set the servo follow gain (rad of wheel per unit, 0 .. 3)
 > a          toggle the automatic Telemetry Ratio setup
+> z          clear the latency statistics
+> x          toggle the CRSF shot phase correction
+> f <us>     force the channel frame interval (f 0 = follow the radio)
 > h          help
 ```
 
@@ -286,6 +289,58 @@ the raw CRSF channel scale:
 The handset decodes it with the same constants and converts it to `-1 .. +1`
 around the middle. The frame's values are big endian on the wire, so the
 little-endian bitfield read is swapped back with `be16toh()`.
+
+The frame's `current` field carries the **latency token** (see below).
+
+### Round trip latency
+
+The handset sends a free running 11 bit token in channel 2 alongside the
+position in channel 1. The servo echoes the token it received straight back
+in the telemetry frame, so the handset can match the reply against the moment
+it sent that token and measure the whole loop on its own clock - no clock
+synchronisation between the two boards is needed:
+
+```
+handset --CRSF--> radio --air--> receiver --CRSF--> servo
+handset <--CRSF-- radio <--air-- receiver <--CRSF-- servo
+```
+
+A ring of 32 (token, timestamp) pairs is enough: the tokens repeat every
+8.2 s and the ring covers 64 ms at 2 ms per frame.
+
+Measured on the bench with ELRS 3.3.2, Packet Rate `D250`, Telemetry Ratio
+`1:2`, ~30 cm between the antennas:
+
+| statistic | round trip |
+| --------- | ---------- |
+| median | **13 ms** |
+| mean | 13.8 ms |
+| fastest observed | 8 ms |
+| typical spread | 9 - 18 ms |
+| occasional outliers | 25 - 60 ms (dropped telemetry frames) |
+
+The distribution is **quantised into 4 ms steps** (modes at roughly 9, 13 and
+17 ms), which is exactly the over-the-air packet interval - the round trip
+has to wait for uplink and downlink slots, so it can only land on slot
+boundaries. Half of that is a fair estimate for one direction, about 6.5 ms.
+
+Two things measurably tighten the spread and both are on by default:
+
+* **Sending at 2 ms instead of 4 ms.** The interval field in the `0x3A`
+  timing frame is the rate the radio *measured us* sending at, not a command.
+  At 4 ms our newest frame is on average 1.9 ms old when the radio transmits
+  it; at 2 ms that drops to 0.5 ms. `packet_rate` is therefore capped at
+  `HANDSET_MAX_INTERVAL_US` (2 ms); `f <us>` overrides it and `f 0` follows
+  the radio.
+* **The phase correction** (`x` toggles it). Switching it off made the median
+  worse (16 ms instead of 14 ms) at 4 ms per frame.
+
+The latency histogram is printed by `d` in 1 ms buckets, and `z` clears it.
+
+Not every ELRS build relays `0x14` link statistics to the handset, so the
+sketch treats **fresh servo telemetry** as the sign that the link is up
+(`linkIsUp()`). That matters for the automatic Telemetry Ratio setup, which
+otherwise waits forever for a frame that never arrives.
 
 ### Loop gain
 

@@ -67,6 +67,73 @@ uint32_t channelstime = 0;      // nominal transmit schedule (micros() domain)
 #define AUTO_SET_TLM_RATIO  1
 
 // ---------------------------------------------------------------------------
+// Encoder wrap handling
+//
+// The AS5048A is a single turn sensor: its angle output wraps at 2*pi.
+// SimpleFOC only notices that wrap when more than 0.8 of a revolution passes
+// between two sensor updates (Sensor::update()), so a rotor that crosses the
+// encoder zero *slowly* is not tracked at all - getAngle() then steps by a
+// whole turn, the position error jumps by 2*pi and the position lock stops
+// driving the motor (it would even drive it the wrong way).
+//
+// Watch the raw angle ourselves and keep motor.sensor_offset in step, so the
+// position the controller sees stays continuous across the wrap. If SimpleFOC
+// did track the wrap itself we must not compensate twice.
+// ---------------------------------------------------------------------------
+static float encoder_last_raw = 0.0f;
+static int   encoder_last_turns = 0;
+static bool  encoder_valid = false;
+
+static void encoderReset()
+{
+  encoder_last_raw = sensor1.getSensorAngle();
+  encoder_last_turns = sensor1.getFullRotations();
+  encoder_valid = true;
+}
+
+static void encoderCheckWrap()
+{
+  float raw = sensor1.getSensorAngle();
+  int turns = sensor1.getFullRotations();
+  if (!encoder_valid) { encoderReset(); return; }
+
+  if (turns == encoder_last_turns)
+  {
+    float d = raw - encoder_last_raw;
+    if (d < -PI)
+      motor.sensor_offset -= (float)motor.sensor_direction * (2.0f * PI);
+    else if (d > PI)
+      motor.sensor_offset += (float)motor.sensor_direction * (2.0f * PI);
+  }
+  encoder_last_raw = raw;
+  encoder_last_turns = turns;
+}
+
+// ---------------------------------------------------------------------------
+// Round trip latency measurement
+//
+// The handset sends the sensor position in channel 1 and a free running
+// token in channel 2. The servo echoes the token back in its telemetry
+// frame, so the handset can match it against the moment it sent it and
+// measure the full ELRS round trip on its own clock - no clock sync needed.
+//
+//   handset --CRSF--> radio --air--> receiver --CRSF--> servo
+//   handset <--CRSF-- radio <--air-- receiver <--CRSF-- servo
+// ---------------------------------------------------------------------------
+#define LAT_RING 32
+
+static uint16_t lat_token[LAT_RING];      // token that was sent
+static uint32_t lat_sent_us[LAT_RING];    // when it was sent
+static uint16_t tx_token = 0;
+static uint32_t lat_samples = 0;
+static uint32_t lat_min = 0xFFFFFFFF, lat_max = 0;
+static double   lat_sum = 0;
+// Round trip histogram in 1 ms buckets, so the shape of the distribution is
+// visible without logging every single sample.
+#define LAT_HIST 64
+static uint16_t lat_hist[LAT_HIST];
+
+// ---------------------------------------------------------------------------
 // The closed loop
 //
 //   pilot turns the wheel  ->  handset angle -> ELRS channel -> servo
@@ -88,6 +155,13 @@ float motor_target_rad = 0.0f;      // manual trim, from the menu
 float follow_gain_rad = 0.5f;       // rad of wheel per unit of servo position
 float servo_position = 0.0f;        // -1 .. +1, from the servo's telemetry
 uint32_t servo_position_ts = 0;
+
+static int32_t last_offset_us = 0;  // measured CRSF shot phase error
+static bool    phase_enabled = true;      // runtime switch, menu 'x'
+static int32_t forced_interval_us = 0;    // 0 = follow the radio, menu 'f'
+
+// Defined with the automatic Telemetry Ratio logic below.
+static bool linkIsUp();
 
 // ---------------------------------------------------------------------------
 // ELRS parameter / menu support
@@ -210,14 +284,99 @@ static ParamSlot *paramById(uint8_t id)
 // The servo reports its position in the battery sensor frame's voltage field,
 // in the raw CRSF channel scale: 172 = servo at min_angle, 1811 = servo at
 // max_angle, the midpoint = servo at centre_angle.
+// The servo answers in the battery sensor frame:
+//   voltage : the servo's own position, raw CRSF channel scale
+//   current : the token it received, echoed back
+// The radio sends link statistics (0x14), so this tells us whether the ELRS
+// link to the receiver is actually up.
+static void linkStats(crsfLinkStatistics_t *ls)
+{
+  static uint32_t last = 0;
+  if (millis() - last < 1000) return;
+  last = millis();
+  Serial.print("  crsf: frames=");
+  Serial.print(crsf.framesReceived());
+  Serial.print(" bytes=");
+  Serial.print(crsf.bytesReceived());
+  Serial.print("  link: up_lq=");
+  Serial.print(ls->uplink_Link_quality);
+  Serial.print("%  down_lq=");
+  Serial.print(ls->downlink_Link_quality);
+  Serial.print("%  up_snr=");
+  Serial.print(ls->uplink_SNR);
+  Serial.print("  down_snr=");
+  Serial.print(ls->downlink_SNR);
+  Serial.print("  rf_mode=");
+  Serial.println(ls->rf_Mode);
+}
+
+// Dump every frame we receive, whatever it is, so an unexpected frame type
+// can be identified instead of silently ignored.
+static void anyMessage(uint8_t addr, uint8_t type, uint8_t len, const uint8_t *buf)
+{
+
+  static uint8_t seen_addr[256], seen_type[256];
+  // Print the first few of each addr/type pair, then stay quiet.
+  (void)len;
+  if (seen_type[type] < 3)
+  {
+    seen_type[type]++;
+    seen_addr[addr] = 1;
+    Serial.print("  RX addr=0x");
+    Serial.print(addr, HEX);
+    Serial.print(" type=0x");
+    Serial.print(type, HEX);
+    Serial.print(" len=");
+    Serial.print(len);
+    Serial.print(" hdr=");
+    for (uint8_t i = 0; i < 6; i++)
+    {
+      Serial.print(buf[i], HEX);
+      Serial.print(' ');
+    }
+    Serial.println();
+  }
+}
+
 void vbatMessage(crsf_sensor_battery_t *vbatSensor){
   // The battery frame carries its values big endian on the wire, so the
   // little endian bitfield read has to be swapped back.
-  uint16_t raw = be16toh((uint16_t)vbatSensor->voltage);
+  uint16_t pos_raw = be16toh((uint16_t)vbatSensor->voltage);
+  uint16_t token   = be16toh((uint16_t)vbatSensor->current);
+
   float mid = (CRSF_CHANNEL_VALUE_MIN + CRSF_CHANNEL_VALUE_MAX) / 2.0f;
   float half = (CRSF_CHANNEL_VALUE_MAX - CRSF_CHANNEL_VALUE_MIN) / 2.0f;
-  servo_position = ((float)raw - mid) / half;      // -1 .. +1
+  servo_position = ((float)pos_raw - mid) / half;      // -1 .. +1
   servo_position_ts = millis();
+
+  // Match the token against the moment we sent it
+  uint8_t idx = (uint8_t)(token % LAT_RING);
+  if (lat_token[idx] == token && lat_sent_us[idx] != 0)
+  {
+    uint32_t rtt = micros() - lat_sent_us[idx];
+    lat_samples++;
+    lat_sum += rtt;
+    if (rtt < lat_min) lat_min = rtt;
+    if (rtt > lat_max) lat_max = rtt;
+    if (rtt / 1000 < LAT_HIST)
+      lat_hist[rtt / 1000]++;
+    if (lat_samples % 10 == 0)
+    {
+      Serial.print("  rtt=");
+      Serial.print(rtt / 1000.0f, 2);
+      Serial.print(" ms  token=");
+      Serial.print(token);
+      Serial.print("  servo_pos=");
+      Serial.print(servo_position, 3);
+      Serial.print("  [min ");
+      Serial.print(lat_min / 1000.0f, 2);
+      Serial.print("  avg ");
+      Serial.print(lat_sum / lat_samples / 1000.0f, 2);
+      Serial.print("  max ");
+      Serial.print(lat_max / 1000.0f, 2);
+      Serial.println(" ms]");
+    }
+  }
 }
 
 static void deviceInfoMessage(crsf_device_info_t *info)
@@ -301,6 +460,9 @@ static void printHelp()
     Serial.println("  d          show link / timing status");
     Serial.println("  p          show the motor target angle");
     Serial.println("  p <deg>    set the motor trim angle (from the boot position)");
+    Serial.println("  z          clear the latency statistics");
+    Serial.println("  x          toggle the CRSF shot phase correction");
+    Serial.println("  f <us>     force the channel frame interval (f 0 = follow the radio)");
     Serial.println("  g          show the servo follow gain");
     Serial.println("  g <gain>   set the servo follow gain (rad of wheel per unit)");
     Serial.println("  a          toggle the automatic Telemetry Ratio setup");
@@ -442,16 +604,51 @@ static void setTelemRatio()
 static void printStatus()
 {
     Serial.println();
-    Serial.print("  link up           : "); Serial.println(crsf.isLinkUp() ? "yes" : "no");
+    // The ELRS module does not always relay 0x14 link statistics, so treat
+    // fresh servo telemetry as the authoritative sign of a live link.
+    Serial.print("  link up           : "); Serial.println(linkIsUp() ? "yes" : "no");
     Serial.print("  packet rate       : "); Serial.print(packet_rate); Serial.println(" us");
     Serial.print("  phase correction  : "); Serial.print(phase_correction); Serial.println(" us (+ = later)");
     Serial.print("  phase integrator   : "); Serial.print(phase_integral); Serial.println(" us");
+    Serial.print("  last phase offset   : "); Serial.print(last_offset_us); Serial.println(" us");
+    Serial.print("  phase correction    : "); Serial.println(phase_enabled ? "on" : "off");
+    Serial.print("  frame interval      : ");
+    if (forced_interval_us) { Serial.print(forced_interval_us); Serial.println(" us (forced)"); }
+    else Serial.println("follows the radio");
     Serial.print("  motor trim          : ");
     Serial.print(motor_target_rad * 180.0f / PI);
     Serial.println(" deg from the boot position");
     Serial.print("  servo follow gain   : ");
     Serial.print(follow_gain_rad);
     Serial.println(" rad per unit");
+    Serial.print("  crsf frames/bytes   : ");
+    Serial.print(crsf.framesReceived());
+    Serial.print(" / ");
+    Serial.println(crsf.bytesReceived());
+    Serial.print("  round trips         : ");
+    Serial.println(lat_samples);
+    Serial.print("  rtt min/avg/max     : ");
+    if (lat_samples)
+    {
+        Serial.print(lat_min / 1000.0f, 2); Serial.print(" / ");
+        Serial.print(lat_sum / lat_samples / 1000.0f, 2); Serial.print(" / ");
+        Serial.print(lat_max / 1000.0f, 2);
+    }
+    else
+    {
+        Serial.print("-");
+    }
+    Serial.println(" ms");
+    Serial.println("  rtt histogram (ms : count)");
+    for (uint8_t i = 0; i < LAT_HIST; i++)
+    {
+        if (lat_hist[i] == 0) continue;
+        Serial.print("    ");
+        if (i < 10) Serial.print(' ');
+        Serial.print(i);
+        Serial.print(" : ");
+        Serial.println(lat_hist[i]);
+    }
     Serial.print("  servo position      : ");
     Serial.print(servo_position);
     Serial.print("  (age ");
@@ -471,7 +668,42 @@ static void handleCommand(char *line)
     if (*line == 0)
         return;
 
-    if (strcmp(line, "h") == 0 || strcmp(line, "help") == 0)
+    if (strcmp(line, "x") == 0)
+    {
+        phase_enabled = !phase_enabled;
+        if (!phase_enabled)
+        {
+            phase_correction = 0;
+            phase_integral = 0;
+        }
+        Serial.print("  phase correction ");
+        Serial.println(phase_enabled ? "on" : "off");
+    }
+    else if (strncmp(line, "f ", 2) == 0)
+    {
+        int32_t us = atoi(&line[2]);
+        if (us < 0)
+            us = 0;
+        forced_interval_us = us;
+        Serial.print("  frame interval ");
+        if (us == 0)
+            Serial.println("follows the radio");
+        else
+        {
+            Serial.print(us);
+            Serial.println(" us");
+        }
+    }
+    else if (strcmp(line, "z") == 0)
+    {
+        lat_samples = 0;
+        lat_sum = 0;
+        lat_min = 0xFFFFFFFF;
+        lat_max = 0;
+        memset(lat_hist, 0, sizeof(lat_hist));
+        Serial.println("  latency statistics cleared");
+    }
+    else if (strcmp(line, "h") == 0 || strcmp(line, "help") == 0)
     {
         printHelp();
     }
@@ -630,6 +862,14 @@ static void pollScan()
 // Automatic Telemetry Ratio setup
 // ---------------------------------------------------------------------------
 
+// Not every ELRS build relays 0x14 link statistics to the handset, so fresh
+// servo telemetry is the reliable sign that the link is up.
+static bool linkIsUp()
+{
+    return crsf.isLinkUp() ||
+           (servo_position_ts != 0 && (uint32_t)(millis() - servo_position_ts) < 500);
+}
+
 static void pollAutoTlm()
 {
     if (!autoTlmEnabled || autoTlmState == AUTO_DONE)
@@ -638,7 +878,7 @@ static void pollAutoTlm()
     switch (autoTlmState)
     {
     case AUTO_WAIT_LINK:
-        if (crsf.isLinkUp())
+        if (linkIsUp())
         {
             Serial.println("  link up, querying ELRS parameters ...");
             crsf.sendDevicePing(CRSF_ADDRESS_BROADCAST);
@@ -688,17 +928,45 @@ void opentxSyncMessage(crsf_opentx_sync_t *TXsync)
     // Both fields are big endian and in units of 100 ns.
     int32_t interval_us = (int32_t)htonl(TXsync->packet_inteval) / 10;
     int32_t offset_us   = (int32_t)htonl(TXsync->phase_shift) / 10;
+    last_offset_us = offset_us;
 
-    // The radio wants us to transmit at exactly this interval.
-    packet_rate = interval_us;
+    // The interval field echoes the rate the radio measured us sending at,
+    // so it is a measurement, not a command. Match the over-the-air rate
+    // instead of half of it, or our newest frame is always half an interval
+    // old by the time the radio transmits it.
+    // Cap the interval at 2 ms: the radio echoes the rate it measured us
+    // sending at, and at 250 Hz the newest frame is already half an interval
+    // old by the time it goes out. Sending at 500 Hz halves that, which
+    // measured as a tighter round trip distribution.
+    #define HANDSET_MAX_INTERVAL_US 2000
+    if (forced_interval_us > 0)
+        packet_rate = (uint32_t)forced_interval_us;
+    else if (interval_us < HANDSET_MAX_INTERVAL_US)
+        packet_rate = (uint32_t)interval_us;
+    else
+        packet_rate = HANDSET_MAX_INTERVAL_US;
 
-    // offset > 0 means our data came too early, so we have to transmit later.
-    // The correction is applied to the transmit phase; the period stays at
+    if (!phase_enabled)
+    {
+        phase_correction = 0;
+        phase_integral = 0;
+        return;
+    }
+
+    // offset > 0 means our data was already this old when the radio sent it,
+    // so transmit later. The correction shifts the phase; the period stays at
     // the requested interval. Parameter traffic perturbs the radio's phase
     // measurement, so the controller is frozen while a scan is running.
     if (!scanInProgress)
     {
         phase_integral += (int32_t)(offset_us * PHASE_KI);
+        // Clamp the integrator itself: otherwise it winds up without bound
+        // once the correction saturates, and the saturated phase shift is
+        // pure added latency.
+        if (phase_integral > PHASE_LIMIT)
+            phase_integral = PHASE_LIMIT;
+        if (phase_integral < -PHASE_LIMIT)
+            phase_integral = -PHASE_LIMIT;
         int32_t corr = (int32_t)(offset_us * PHASE_KP) + phase_integral;
         if (corr > PHASE_LIMIT)
             corr = PHASE_LIMIT;
@@ -725,6 +993,8 @@ void setup() {
 
   crsf.onPacketVBat = &vbatMessage;
   crsf.onPacketSync = &opentxSyncMessage;
+  crsf.onPacketLinkStatistics = &linkStats;
+  crsf.onPacketAny = &anyMessage;
   crsf.onPacketDeviceInfo = &deviceInfoMessage;
   crsf.onPacketParamEntry = &paramEntryMessage;
   crsf.onPacketParamWriteAck = &paramWriteAck;
@@ -763,6 +1033,7 @@ void setup() {
     motor.loopFOC();
     motor.move();
     motor.sensor_offset = motor.shaft_angle;
+    encoderReset();
   }
 
   // Start the transmit schedule from now
@@ -784,12 +1055,34 @@ void loop() {
   // servo's actual position.
   motor.target = motor_target_rad + follow_gain_rad * servo_position;
   motor.loopFOC();
+  encoderCheckWrap();
   motor.move();
 
   crsf.loop();
   pollConsole();
   pollScan();
   pollAutoTlm();
+
+  // Once a second, report the state of the CRSF link on this side. If the
+  // byte counter stays at 0 then nothing at all is arriving on the CRSF RX
+  // pin, which is a wiring / power problem rather than a protocol problem.
+  static uint32_t health_timer = 0;
+  if ((uint32_t)(millis() - health_timer) >= 1000)
+  {
+    health_timer = millis();
+    Serial.print("HEALTH frames=");
+    Serial.print(crsf.framesReceived());
+    Serial.print(" bytes=");
+    Serial.print(crsf.bytesReceived());
+    Serial.print(" link=");
+    Serial.print(crsf.isLinkUp() ? "up" : "down");
+    Serial.print(" servo_pos=");
+    Serial.print(servo_position, 3);
+    Serial.print(" age=");
+    Serial.print((uint32_t)(millis() - servo_position_ts));
+    Serial.print(" rtt=");
+    Serial.println(lat_samples);
+  }
 
   // The transmit instant is the nominal schedule plus the phase correction.
   // The nominal schedule advances by exactly the radio's requested interval,
@@ -802,7 +1095,13 @@ void loop() {
     //send channels
     sensor1.update();
     angle = sensor1.getAngle();
-    target =   (angle - -3.0f) * (2000 - 1000) / (3.0f - -3.0f) + 1000;
+    // Map the absolute sensor angle over one full turn onto the channel
+    // range. The encoder reports wrapped angles, so normalise to 0..2*pi
+    // first - a fixed window would clamp the ends and lose travel.
+    float turn = fmodf(angle, 2.0f * PI);
+    if (turn < 0.0f)
+      turn += 2.0f * PI;
+    target = 1000.0f + (turn / (2.0f * PI)) * 1000.0f;
     if(target < 1000)
       target = 1000;
     if(target > 2000)
@@ -811,15 +1110,27 @@ void loop() {
 
 
 
-    Serial.print(angle);
-    Serial.print('\t');
-    Serial.println(target);
+    // Rate limited trace: the scheduler runs at the radio's packet rate, so
+    // printing every frame floods the console.
+    static uint32_t trace_timer = 0;
+    if ((uint32_t)(millis() - trace_timer) >= 100)
+    {
+      trace_timer = millis();
+      Serial.print(angle);
+      Serial.print('\t');
+      Serial.println(target);
+    }
 
     // The CRSF channel field is a raw 11 bit value, not microseconds.
     // 191 = 1000 us and 1792 = 2000 us, which is exactly what ELRS's own
     // decoder expects (see CrsfSerial::packetChannelsPacked).
     channels.ch1 = map(target, 1000, 2000, CRSF_CHANNEL_VALUE_1000, CRSF_CHANNEL_VALUE_2000);
-    channels.ch2 = 1;
+    // The token rides along with the position so the servo can echo it back
+    tx_token = (uint16_t)((tx_token + 1) & 0x7FF);
+    uint8_t tidx = (uint8_t)(tx_token % LAT_RING);
+    lat_token[tidx] = tx_token;
+    lat_sent_us[tidx] = micros();
+    channels.ch2 = tx_token;
     channels.ch3 = 1;
     channels.ch4 = 1;
     channels.ch5 = 1;
