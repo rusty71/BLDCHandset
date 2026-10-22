@@ -13,16 +13,48 @@ local fork of the CRSF protocol library.
 
 ## How it works
 
+The full loop, forward and back:
+
+```
+  pilot turns the wheel
+        │
+        ▼
+  ┌───────────────────┐   0x16 RC channels    ┌──────────────┐
+  │  BLDCHandset      │ ────────────────────► │  ELRS radio  │
+  │  (RP2040)         │      (CRSF 420 kbaud) │  (transmitter)│
+  │                   │                       └──────┬───────┘
+  │  AS5048A ─► angle │                              │  air
+  │                   │                              ▼
+  │                   │                       ┌──────────────┐
+  │  BLDC ◄─ follows  │ ◄── 0x08 telemetry ────│ ELRS receiver│
+  │  the servo        │      (via the radio)  │              │
+  └───────────────────┘                       └──────┬───────┘
+                                                       │ 0x16 RC channels
+                                                       ▼
+                                                ┌──────────────┐
+                                                │  BLDCServo   │
+                                                │  BLDC ─► RC car│
+                                                └──────────────┘
+```
+
+Both motors run in **position mode**:
+
+- the **servo** position-locks to the channel the handset injected
+- the **handset's wheel** position-locks to the position the servo reports back
+
 ```
    ELRS radio  ─────── CRSF 420 kbaud ───────►  BLDCHandset (RP2040)
       │  addr 0xEA                                  │  addr 0xC8
-      │  0x08 battery      @  8 ms                  │  0x16 RC channels @ 4 ms
-      │  0x14 link stats   @ 240 ms                 │  (injects the encoder angle
-      │  0x3A HANDSET      @ 200 ms  ── timing ──►  │   as a stick axis)
+      │  0x08 telemetry   @  8 ms  ── servo pos ──► │  0x16 RC channels @ 4 ms
+      │  0x14 link stats   @ 240 ms                 │  (the wheel angle as a stick)
+      │  0x3A HANDSET      @ 200 ms  ── timing ──►  │
       │       0x10 TIMING  (rate + phase offset)    │
       │  ← 0x28/0x29/0x2B/0x2C/0x2D parameter menu ─┘
       └─────────────────────────────────────────────┴──────► ELRS receiver
 ```
+
+The radio forwards the receiver's telemetry back to the handset, which is how
+the servo's position gets home.
 
 The handset impersonates the **flight controller** (`0xC8`) so the radio's CRSF
 output to the ELRS receiver carries the injected axis, and it consumes the
@@ -165,6 +197,10 @@ baud). The prompt is `>`, and `h` prints the help:
 > c <id> <v> set parameter <id> to <v>
 > r <id>     read parameter <id>
 > d          show link / timing status
+> p          show the motor trim angle
+> p <deg>    set the motor trim angle (from the boot position)
+> g          show the servo follow gain
+> g <gain>   set the servo follow gain (rad of wheel per unit, 0 .. 3)
 > a          toggle the automatic Telemetry Ratio setup
 > h          help
 ```
@@ -218,7 +254,7 @@ reorders or renames the entries.
 
 ## The position lock
 
-The motor runs SimpleFOC's angle mode:
+The wheel runs SimpleFOC's angle mode:
 
 ```
 motor.target  ->  P_angle(target - motor.shaft_angle)  ->  velocity setpoint
@@ -226,7 +262,45 @@ motor.target  ->  P_angle(target - motor.shaft_angle)  ->  velocity setpoint
                ->  loopFOC(): commutation against motor.electricalAngle()
 ```
 
-Two things are needed for that to work at all:
+The target is the **trim plus the servo's reported position**:
+
+```cpp
+motor.target = motor_target_rad + follow_gain_rad * servo_position;
+```
+
+`servo_position` is `-1 .. +1`, decoded from the telemetry frame the servo
+sends (see below). The trim and the follow gain are set from the menu
+(`p <deg>` and `g <gain>`).
+
+### The position telemetry
+
+The servo reports its position in the **battery sensor frame** (`0x08`), in
+the raw CRSF channel scale:
+
+| raw value | servo position |
+| --------- | -------------- |
+| `CRSF_CHANNEL_VALUE_MIN` (172) | `min_angle` |
+| `CRSF_CHANNEL_VALUE_MAX` (1811) | `max_angle` |
+| the midpoint (991) | `center_angle` |
+
+The handset decodes it with the same constants and converts it to `-1 .. +1`
+around the middle. The frame's values are big endian on the wire, so the
+little-endian bitfield read is swapped back with `be16toh()`.
+
+### Loop gain
+
+The wheel's angle and the servo's angle are mapped onto the same channel, so
+the loop gain is
+
+```
+loop gain = follow_gain * 2 * (1000 us / 6 rad) / 1000 = follow_gain / 3
+```
+
+Anything below 3 rad is stable; the default of 0.5 rad gives a loop gain of
+0.17, which is far slower than the RF round trip and therefore comfortably
+stable.
+
+Two things are needed for the position lock to work at all:
 
 1. **`motor.loopFOC()` and `motor.move()` must run every iteration.** They
    were missing from `loop()`, so the motor was never commutated and never

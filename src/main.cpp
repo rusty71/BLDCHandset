@@ -67,6 +67,29 @@ uint32_t channelstime = 0;      // nominal transmit schedule (micros() domain)
 #define AUTO_SET_TLM_RATIO  1
 
 // ---------------------------------------------------------------------------
+// The closed loop
+//
+//   pilot turns the wheel  ->  handset angle -> ELRS channel -> servo
+//   servo position         ->  ELRS telemetry -> handset -> wheel follows
+//
+// The wheel is position locked to the servo's reported position, so the
+// follow gain must keep the loop stable. With the servo's range mapped 1:1
+// onto the channel and the wheel's angle mapped onto the same channel, the
+// loop gain is FOLLOW_GAIN_RAD * 2 * (1000/6) / 1000 = FOLLOW_GAIN_RAD/3,
+// so anything below 3 rad is stable. The default is a long way below that.
+//
+// motor.sensor_offset was set to the angle the motor booted at, so 0 means
+// "stay where we booted" and the trim is an offset from there.
+// ---------------------------------------------------------------------------
+#define MOTOR_TARGET_LIMIT_DEG  180.0f
+#define FOLLOW_GAIN_LIMIT       3.0f
+
+float motor_target_rad = 0.0f;      // manual trim, from the menu
+float follow_gain_rad = 0.5f;       // rad of wheel per unit of servo position
+float servo_position = 0.0f;        // -1 .. +1, from the servo's telemetry
+uint32_t servo_position_ts = 0;
+
+// ---------------------------------------------------------------------------
 // ELRS parameter / menu support
 //
 // The radio exposes its settings over the CRSF parameter protocol (0x28..0x2D).
@@ -184,8 +207,17 @@ static ParamSlot *paramById(uint8_t id)
 // CRSF callbacks
 // ---------------------------------------------------------------------------
 
+// The servo reports its position in the battery sensor frame's voltage field,
+// in the raw CRSF channel scale: 172 = servo at min_angle, 1811 = servo at
+// max_angle, the midpoint = servo at centre_angle.
 void vbatMessage(crsf_sensor_battery_t *vbatSensor){
-  Serial.print('.');
+  // The battery frame carries its values big endian on the wire, so the
+  // little endian bitfield read has to be swapped back.
+  uint16_t raw = be16toh((uint16_t)vbatSensor->voltage);
+  float mid = (CRSF_CHANNEL_VALUE_MIN + CRSF_CHANNEL_VALUE_MAX) / 2.0f;
+  float half = (CRSF_CHANNEL_VALUE_MAX - CRSF_CHANNEL_VALUE_MIN) / 2.0f;
+  servo_position = ((float)raw - mid) / half;      // -1 .. +1
+  servo_position_ts = millis();
 }
 
 static void deviceInfoMessage(crsf_device_info_t *info)
@@ -267,6 +299,10 @@ static void printHelp()
     Serial.println("  c <id> <v> set parameter <id> to <v>");
     Serial.println("  r <id>     read parameter <id>");
     Serial.println("  d          show link / timing status");
+    Serial.println("  p          show the motor target angle");
+    Serial.println("  p <deg>    set the motor trim angle (from the boot position)");
+    Serial.println("  g          show the servo follow gain");
+    Serial.println("  g <gain>   set the servo follow gain (rad of wheel per unit)");
     Serial.println("  a          toggle the automatic Telemetry Ratio setup");
     Serial.println("  h          this help");
     Serial.println();
@@ -410,6 +446,17 @@ static void printStatus()
     Serial.print("  packet rate       : "); Serial.print(packet_rate); Serial.println(" us");
     Serial.print("  phase correction  : "); Serial.print(phase_correction); Serial.println(" us (+ = later)");
     Serial.print("  phase integrator   : "); Serial.print(phase_integral); Serial.println(" us");
+    Serial.print("  motor trim          : ");
+    Serial.print(motor_target_rad * 180.0f / PI);
+    Serial.println(" deg from the boot position");
+    Serial.print("  servo follow gain   : ");
+    Serial.print(follow_gain_rad);
+    Serial.println(" rad per unit");
+    Serial.print("  servo position      : ");
+    Serial.print(servo_position);
+    Serial.print("  (age ");
+    Serial.print(millis() - servo_position_ts);
+    Serial.println(" ms)");
     Serial.print("  parameters found  : "); Serial.println(paramCount);
     Serial.print("  auto tlm ratio    : "); Serial.println(autoTlmEnabled ? "on" : "off");
     Serial.println();
@@ -454,6 +501,58 @@ static void handleCommand(char *line)
     else if (strcmp(line, "d") == 0 || strcmp(line, "status") == 0)
     {
         printStatus();
+    }
+    else if (line[0] == 'g' && (line[1] == ' ' || line[1] == 0))
+    {
+        if (line[1] == ' ')
+        {
+            float gain = 0.0f;
+            if (sscanf(line + 2, "%f", &gain) == 1)
+            {
+                if (gain < 0.0f) gain = 0.0f;
+                if (gain > FOLLOW_GAIN_LIMIT) gain = FOLLOW_GAIN_LIMIT;
+                follow_gain_rad = gain;
+                Serial.print("  servo follow gain set to ");
+                Serial.print(gain);
+                Serial.println(" rad per unit");
+            }
+            else
+            {
+                Serial.println("  usage: g <gain>");
+            }
+        }
+        else
+        {
+            Serial.print("  servo follow gain: ");
+            Serial.print(follow_gain_rad);
+            Serial.println(" rad per unit");
+        }
+    }
+    else if (line[0] == 'p' && (line[1] == ' ' || line[1] == 0))
+    {
+        if (line[1] == ' ')
+        {
+            float deg = 0.0f;
+            if (sscanf(line + 2, "%f", &deg) == 1)
+            {
+                if (deg < -MOTOR_TARGET_LIMIT_DEG) deg = -MOTOR_TARGET_LIMIT_DEG;
+                if (deg >  MOTOR_TARGET_LIMIT_DEG) deg =  MOTOR_TARGET_LIMIT_DEG;
+                motor_target_rad = deg * (PI / 180.0f);
+                Serial.print("  motor target set to ");
+                Serial.print(deg);
+                Serial.println(" deg from the boot position");
+            }
+            else
+            {
+                Serial.println("  usage: p <degrees>");
+            }
+        }
+        else
+        {
+            Serial.print("  motor target: ");
+            Serial.print(motor_target_rad * 180.0f / PI);
+            Serial.println(" deg from the boot position");
+        }
     }
     else if (line[0] == 'c' && line[1] == ' ')
     {
@@ -681,6 +780,9 @@ void loop() {
 
   // FOC: commutate the motor and hold its position. This has to run every
   // iteration - without it the motor is never commutated and never held.
+  // Hold the trim plus whatever the servo reports, so the wheel follows the
+  // servo's actual position.
+  motor.target = motor_target_rad + follow_gain_rad * servo_position;
   motor.loopFOC();
   motor.move();
 
@@ -713,7 +815,10 @@ void loop() {
     Serial.print('\t');
     Serial.println(target);
 
-    channels.ch1 = target;
+    // The CRSF channel field is a raw 11 bit value, not microseconds.
+    // 191 = 1000 us and 1792 = 2000 us, which is exactly what ELRS's own
+    // decoder expects (see CrsfSerial::packetChannelsPacked).
+    channels.ch1 = map(target, 1000, 2000, CRSF_CHANNEL_VALUE_1000, CRSF_CHANNEL_VALUE_2000);
     channels.ch2 = 1;
     channels.ch3 = 1;
     channels.ch4 = 1;

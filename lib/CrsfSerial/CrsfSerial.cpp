@@ -200,6 +200,18 @@ void CrsfSerial::processPacketIn(uint8_t len)
         }
     } // CRSF_ADDRESS_FLIGHT_CONTROLLER
 
+    // The radio forwards the ELRS receiver's telemetry (the servo reports its
+    // position in the battery sensor frame) on the radio's own address.
+    if (hdr->device_addr == CRSF_ADDRESS_RADIO_TRANSMITTER)
+    {
+        switch (hdr->type)
+        {
+        case CRSF_FRAMETYPE_BATTERY_SENSOR:
+            packetBattery(hdr);
+            break;
+        }
+    }
+
     // The HANDSET (timing correction) frame is matched on type only: the
     // radio may put its device address or the 0xC8 serial sync byte in the
     // first slot depending on which connector it is delivered through.
@@ -420,6 +432,16 @@ void CrsfSerial::packetParamWriteAck(const crsf_ext_header_t *p)
 
     if (onPacketParamWriteAck)
         onPacketParamWriteAck(p->data[0], &p->data[1], payloadLen - 1);
+}
+
+void CrsfSerial::packetBattery(const crsf_header_t *p)
+{
+    // frame_size counts type + payload + crc, so the payload is frame_size-2
+    if (p->frame_size < 2 + (uint8_t)sizeof(crsf_sensor_battery_t))
+        return;
+    memcpy(&vbatSensor, (const uint8_t *)p + 3, sizeof(vbatSensor));
+    if (onPacketVBat)
+        onPacketVBat(&vbatSensor);
 }
 
 void CrsfSerial::packetLinkStatistics(const crsf_header_t *p)

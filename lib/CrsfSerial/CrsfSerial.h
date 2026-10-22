@@ -108,6 +108,7 @@ private:
     // Packet Handlers
     void packetChannelsPacked(const crsf_header_t *p);
     void packetLinkStatistics(const crsf_header_t *p);
+    void packetBattery(const crsf_header_t *p);
     void packetOpenTXSync(const crsf_opentx_sync_t *p);
     void packetGps(const crsf_header_t *p);
     void packetDeviceInfo(const crsf_ext_header_t *p);
